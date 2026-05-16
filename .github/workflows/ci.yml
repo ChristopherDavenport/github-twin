@@ -21,7 +21,7 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0   # full history so hatch-vcs can read tags during build smoke-test
       - uses: astral-sh/setup-uv@v6
