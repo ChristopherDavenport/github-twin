@@ -177,6 +177,8 @@ module = [
     "sklearn.*",
     "faiss",
     "opentelemetry.exporter.*",
+    "opentelemetry.sdk",
+    "opentelemetry.sdk.*",
     "pygments.*",
     "keyring",
     "keyring.*",
