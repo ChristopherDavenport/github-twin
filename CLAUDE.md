@@ -105,7 +105,7 @@ data/                    # gitignored; one subdir per target if you switch
 
 | Surface | Config key | Default | Opt-in |
 |---|---|---|---|
-| Embedder | `cfg.embed.backend` | `ollama` | `sentence_transformers` (`[st]` extra) |
+| Embedder | `cfg.embed.backend` | `ollama` | `sentence_transformers` (`[st]` extra) or `gemini` (remote — uses existing `google-genai` dep; sends chunk text off-box to Google) |
 | Vector store | `cfg.vector_store.backend` | `sqlite-vec` | `faiss` (`[faiss]` extra) |
 | BM25 query expansion | `cfg.retrieval.query_expansion` | `rule` | `ollama` (small local model) or `off` |
 | Chunk summary LLM | `cfg.summarize.backend` | `auto` (Claude > Gemini > Ollama) | force any of the three |
@@ -113,6 +113,22 @@ data/                    # gitignored; one subdir per target if you switch
 
 Switching DBs between targets is done via `GT_PATHS__DATA_DIR=...`; one DB
 per `target` row by construction.
+
+The `gemini` embedder is the only backend that sends chunk text to a
+remote API. Pick it deliberately — it exists for users who have a Gemini
+API key (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) but neither Ollama nor the
+`[st]` extra available. Default model is `gemini-embedding-001` at 3072
+dims; `cfg.embed.dim` 1536 or 768 are also supported via the SDK's
+`output_dimensionality`.
+
+The embedder backend is a per-DB commitment (`sqlite-vec` bakes the
+dim into the virtual table at first creation), so `gt init` accepts
+`--embed-backend` / `--embed-model` / `--embed-dim` flags that stamp
+the chosen values into `config.toml` *before* the DB is opened.
+Helpers: `_resolve_embed_defaults` and `_persist_embed_config` in
+`cli.py`. Re-running with the same values is idempotent; re-running
+with different values against an existing `[embed]` block raises
+`typer.BadParameter` to refuse a silent overwrite.
 
 ## Embed-time prefix (contextual retrieval)
 

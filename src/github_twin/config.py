@@ -70,7 +70,9 @@ class RetrievalCfg(BaseModel):
 
 
 class EmbedCfg(BaseModel):
-    # 'ollama' (default) or 'sentence_transformers' (opt-in via [st] extra).
+    # 'ollama' (default, local) | 'sentence_transformers' (local, opt-in via
+    # [st] extra) | 'gemini' (remote — sends chunk text to Google; uses the
+    # google-genai dep that's already pulled in by distill/eval).
     backend: str = "ollama"
     model: str = "nomic-embed-text"
     dim: int = 768

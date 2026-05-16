@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
@@ -86,6 +87,77 @@ def _ctx(config_path: Path | None) -> tuple[Config, sqlite3.Connection]:
     return cfg, conn
 
 
+def _resolve_embed_defaults(
+    backend: str | None,
+    model: str | None,
+    dim: int | None,
+) -> tuple[str, str, int]:
+    """Fill in backend-aware defaults for the three embed flags.
+
+    Returns `(backend, model, dim)` with all three populated. Raises
+    `typer.BadParameter` for unknown backends or for
+    sentence_transformers without an explicit model+dim (no safe
+    default — the model and its output dim are coupled).
+    """
+    backend = (backend or "ollama").strip()
+    if backend == "ollama":
+        return "ollama", model or "nomic-embed-text", dim or 768
+    if backend == "gemini":
+        return "gemini", model or "gemini-embedding-001", dim or 3072
+    if backend == "sentence_transformers":
+        if not model or not dim:
+            raise typer.BadParameter(
+                "--embed-model and --embed-dim are required when "
+                "--embed-backend=sentence_transformers (e.g. "
+                "BAAI/bge-small-en-v1.5 / 384)."
+            )
+        return "sentence_transformers", model, dim
+    raise typer.BadParameter(
+        f"Unknown --embed-backend: {backend!r}. Pick from: ollama, gemini, sentence_transformers."
+    )
+
+
+def _persist_embed_config(
+    config_path: Path,
+    backend: str,
+    model: str,
+    dim: int,
+) -> None:
+    """Write a `[embed]` block into the given config.toml.
+
+    Behavior:
+      * file absent: create it with just the `[embed]` block.
+      * file present, no `[embed]` block: append the block.
+      * file present, `[embed]` block matches the requested values: no-op.
+      * file present, `[embed]` block differs: raise `typer.BadParameter`
+        — refuse to silently overwrite hand-edited config.
+    """
+    new_block = f'[embed]\nbackend = "{backend}"\nmodel = "{model}"\ndim = {int(dim)}\n'
+    if not config_path.exists():
+        config_path.write_text(new_block, encoding="utf-8")
+        return
+    with config_path.open("rb") as f:
+        existing_data = tomllib.load(f)
+    existing = existing_data.get("embed", {})
+    if (
+        existing.get("backend") == backend
+        and existing.get("model") == model
+        and int(existing.get("dim", -1)) == int(dim)
+    ):
+        return
+    if not existing:
+        current = config_path.read_text(encoding="utf-8")
+        sep = "" if current.endswith("\n") else "\n"
+        config_path.write_text(current + sep + "\n" + new_block, encoding="utf-8")
+        return
+    raise typer.BadParameter(
+        f"Existing {config_path} has [embed] with backend="
+        f"{existing.get('backend')!r}, model={existing.get('model')!r}, "
+        f"dim={existing.get('dim')!r}; flags ask for backend={backend!r}, "
+        f"model={model!r}, dim={dim}. Edit the file directly to change it."
+    )
+
+
 def _report(msg: str) -> None:
     console.print(msg)
 
@@ -151,9 +223,41 @@ def init(
             "'owner/name' for --kind=repo. Falls back to pwd .git/config origin URL when omitted."
         ),
     ),
+    embed_backend: str | None = typer.Option(
+        None,
+        "--embed-backend",
+        help=(
+            "Stamp embedder backend into config.toml: 'ollama' (default) | "
+            "'gemini' (remote, needs GEMINI_API_KEY/GOOGLE_API_KEY) | "
+            "'sentence_transformers' (requires --embed-model + --embed-dim)."
+        ),
+    ),
+    embed_model: str | None = typer.Option(
+        None,
+        "--embed-model",
+        help="Embedder model. Defaults per backend (nomic-embed-text / gemini-embedding-001).",
+    ),
+    embed_dim: int | None = typer.Option(
+        None,
+        "--embed-dim",
+        help="Embedding dimension. Defaults per backend (768 ollama / 3072 gemini).",
+    ),
     config: Path | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Discover the target (a user, an org, or a single repo) and open the DB."""
+    # Stamp embed config BEFORE _ctx — _ctx's open_db bakes cfg.embed.dim
+    # into the sqlite-vec table at first creation; once set, it can only
+    # be changed by recreating the DB.
+    if embed_backend is not None or embed_model is not None or embed_dim is not None:
+        resolved_backend, resolved_model, resolved_dim = _resolve_embed_defaults(
+            embed_backend, embed_model, embed_dim
+        )
+        target_config = config if config is not None else Path("config.toml")
+        _persist_embed_config(target_config, resolved_backend, resolved_model, resolved_dim)
+        console.print(
+            f"[dim]Embed config written to {target_config}: "
+            f"backend={resolved_backend} model={resolved_model} dim={resolved_dim}[/dim]"
+        )
     cfg, conn = _ctx(config)
     kind = kind.lower()
 
