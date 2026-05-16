@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ChristopherDavenport/github-twin/security/policy
+    about: Do not file a public issue. See SECURITY.md for the private reporting channel.

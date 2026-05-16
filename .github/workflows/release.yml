@@ -1,0 +1,88 @@
+name: release
+
+# Fires on any annotated semver tag (`v0.1.0`, `v1.0.0rc2`, ...). The
+# `hatch-vcs` build hook strips the leading `v` and writes the PEP 440
+# version into the wheel and `github_twin._version`, so the tag IS the
+# version source of truth — no manual edits to pyproject.toml.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"            # 1.2.3
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"     # 1.2.3a1
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"     # 1.2.3b1
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"    # 1.2.3rc1
+      - "v[0-9]+.[0-9]+.[0-9]+.post[0-9]+" # 1.2.3.post1
+
+jobs:
+  # Gate publishing on a green test pass. Re-uses the same matrix as
+  # ci.yml so the release pipeline never publishes broken artifacts.
+  test:
+    name: test (python-${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history so hatch-vcs sees tags
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --extra st --extra faiss --dev
+      - run: uv run ruff check src/ tests/
+      - run: uv run ruff format --check src/ tests/
+      - run: uv run mypy
+      - run: uv run pytest -q
+      - run: uv build
+      - name: Upload build artifacts (3.12 only)
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to PyPI
+    needs: test
+    runs-on: ubuntu-latest
+    # Use a GitHub Environment named `pypi` so the maintainer can require
+    # manual approval before publish (Settings → Environments → pypi →
+    # "Required reviewers"). Remove this line if you want unattended pushes.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/github-twin/
+    permissions:
+      # `id-token: write` covers both PyPI Trusted Publishing (OIDC) and
+      # SLSA build provenance attestations — Sigstore signs the dist files
+      # with the same workflow identity. `attestations: write` lets the
+      # publish action upload the attestation bundle to PyPI alongside the
+      # wheel/sdist; consumers can verify it with `pypi-attestations` or
+      # `pip verify`. No PyPI API token is stored in repo secrets.
+      id-token: write
+      attestations: write
+      contents: write     # for the GitHub Release step
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # SLSA L2 provenance: the action generates Sigstore attestations
+          # tied to this workflow+tag and uploads them with the dist files.
+          attestations: true
+        # No `password:` field — Trusted Publishing handles auth via OIDC.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Auto-generate notes from PRs merged since the previous tag.
+          # Customize via .github/release.yml when you want category buckets.
+          generate_release_notes: true
+          # Mark pre-releases (a/b/rc) so they don't replace "Latest".
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
+          files: dist/*

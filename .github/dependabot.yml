@@ -1,0 +1,27 @@
+# Dependabot configuration.
+# Weekly updates for Python deps (read from pyproject.toml) and the
+# GitHub Actions pinned in .github/workflows/. Minor/patch bumps are
+# grouped into a single PR per ecosystem; major bumps land as
+# individual PRs so review attention matches risk.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "ci"
