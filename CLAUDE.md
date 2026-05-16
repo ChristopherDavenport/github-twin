@@ -105,7 +105,7 @@ data/                    # gitignored; one subdir per target if you switch
 
 | Surface | Config key | Default | Opt-in |
 |---|---|---|---|
-| Embedder | `cfg.embed.backend` | `ollama` | `sentence_transformers` (`[st]` extra) |
+| Embedder | `cfg.embed.backend` | `ollama` | `sentence_transformers` (`[st]` extra) or `gemini` (remote — uses existing `google-genai` dep; sends chunk text off-box to Google) |
 | Vector store | `cfg.vector_store.backend` | `sqlite-vec` | `faiss` (`[faiss]` extra) |
 | BM25 query expansion | `cfg.retrieval.query_expansion` | `rule` | `ollama` (small local model) or `off` |
 | Chunk summary LLM | `cfg.summarize.backend` | `auto` (Claude > Gemini > Ollama) | force any of the three |
@@ -113,6 +113,13 @@ data/                    # gitignored; one subdir per target if you switch
 
 Switching DBs between targets is done via `GT_PATHS__DATA_DIR=...`; one DB
 per `target` row by construction.
+
+The `gemini` embedder is the only backend that sends chunk text to a
+remote API. Pick it deliberately — it exists for users who have a Gemini
+API key (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) but neither Ollama nor the
+`[st]` extra available. Default model is `gemini-embedding-001` at 3072
+dims; `cfg.embed.dim` 1536 or 768 are also supported via the SDK's
+`output_dimensionality`.
 
 ## Embed-time prefix (contextual retrieval)
 

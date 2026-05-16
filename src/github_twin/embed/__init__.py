@@ -20,6 +20,16 @@ def make_embedder(cfg: EmbedCfg) -> Embedder:
             device=cfg.device,
             batch_size=cfg.batch_size,
         )
+    if cfg.backend == "gemini":
+        # Lazy import for symmetry with the other branches; google-genai is
+        # already a hard dep so the import itself won't fail.
+        from github_twin.embed.gemini import GeminiEmbedder
+
+        return GeminiEmbedder(
+            model=cfg.model,
+            dim=cfg.dim,
+            batch_size=cfg.batch_size,
+        )
     raise ValueError(f"Unknown embed backend: {cfg.backend!r}")
 
 

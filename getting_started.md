@@ -23,7 +23,7 @@ Everything stays local. SQLite + `sqlite-vec` on disk, Ollama for embeddings. On
 |---|---|---|
 | **Linux/macOS/WSL** | Tested on WSL2 + Ubuntu | — |
 | **Python 3.12+** | Required by `pyproject.toml` | `python3 --version` to check |
-| **[Ollama](https://ollama.com)** | Local embeddings (mandatory) | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[Ollama](https://ollama.com)** | Local embeddings (default — skip if using the Gemini embedder) | `curl -fsSL https://ollama.com/install.sh \| sh` |
 | **[`uv`](https://docs.astral.sh/uv/)** | Python project manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **~500 MB disk** | Embedding model + cached GitHub responses + DB | — |
 
