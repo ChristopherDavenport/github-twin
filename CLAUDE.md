@@ -121,6 +121,15 @@ API key (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) but neither Ollama nor the
 dims; `cfg.embed.dim` 1536 or 768 are also supported via the SDK's
 `output_dimensionality`.
 
+The embedder backend is a per-DB commitment (`sqlite-vec` bakes the
+dim into the virtual table at first creation), so `gt init` accepts
+`--embed-backend` / `--embed-model` / `--embed-dim` flags that stamp
+the chosen values into `config.toml` *before* the DB is opened.
+Helpers: `_resolve_embed_defaults` and `_persist_embed_config` in
+`cli.py`. Re-running with the same values is idempotent; re-running
+with different values against an existing `[embed]` block raises
+`typer.BadParameter` to refuse a silent overwrite.
+
 ## Embed-time prefix (contextual retrieval)
 
 `pipeline._flush` doesn't embed `chunk.text` raw — it routes through

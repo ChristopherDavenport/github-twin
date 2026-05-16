@@ -13,7 +13,7 @@ A personal RAG over your own GitHub history (commits + PR review comments), expo
 
 Plus a distillation step that clusters review comments into reusable rules (e.g. *"Prefer Outcome over raceN/firstCompletedOf"*).
 
-Everything stays local. SQLite + `sqlite-vec` on disk, Ollama for embeddings. Only the distillation step optionally calls a hosted LLM (Claude or Gemini), and even that has a local Ollama fallback.
+Everything stays local by default. SQLite + `sqlite-vec` on disk, Ollama for embeddings. Only the distillation step optionally calls a hosted LLM (Claude or Gemini), and even that has a local Ollama fallback. (If you have a Gemini API key but no Ollama install, you can opt in to remote Gemini embeddings at init time: `gt init --embed-backend gemini` — see [Embedder backends](#embedder-backends) in the README.)
 
 ---
 

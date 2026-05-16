@@ -160,6 +160,22 @@ We keep the embedder backend separate from the LLM backend. Choose one:
   Gemini key but no Ollama / `[st]` install, and your corpus is okay
   to share with Google.
 
+The embedder is a per-DB commitment — `sqlite-vec` bakes the vector
+dimension into the table at first creation. Stamp the choice into
+`config.toml` at init time so every subsequent command picks it up:
+
+```sh
+gt init --embed-backend gemini                              # gemini-embedding-001, 3072
+gt init --embed-backend gemini --embed-dim 1536            # request shorter output
+gt init --embed-backend sentence_transformers \
+        --embed-model BAAI/bge-small-en-v1.5 --embed-dim 384
+```
+
+Re-running with the same values is a no-op; running with different
+values against an existing `config.toml` fails loud rather than
+silently changing the corpus. `GT_EMBED__*` env vars still work for
+one-off overrides and CI.
+
 A "cloud-LLM only" setup either needs an embedder process (Ollama /
 `[st]`) or has to opt into the remote Gemini embedder.
 
