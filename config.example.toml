@@ -1,0 +1,41 @@
+# Copy to config.toml and edit. Anything you leave unset uses the defaults below.
+
+[paths]
+# All persistent state lives under this directory.
+data_dir = "./data"
+
+[embed]
+backend = "ollama"
+model = "nomic-embed-text"
+dim = 768
+# Ollama HTTP endpoint. Leave as-is unless you moved it.
+ollama_host = "http://127.0.0.1:11434"
+
+[ingest]
+# Earliest date to fetch on first ingest. Re-ingest after this date won't re-fetch.
+since = "2018-01-01"
+# Optional explicit allow/deny for repos. Patterns are "owner/repo", "*" wildcards allowed.
+include_repos = []
+exclude_repos = []
+# Patterns we never chunk as code (lockfiles, generated, vendored).
+exclude_paths = [
+    "**/*.lock",
+    "**/package-lock.json",
+    "**/yarn.lock",
+    "**/Cargo.lock",
+    "**/vendor/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.min.js",
+]
+
+[identity]
+# Override the discovered identity if it's wrong.
+# extra_emails = ["old-work@example.com"]
+# ignore_emails = ["bot@example.com"]
+
+[distill]
+# Only used by P2 distillation. Quality matters here so we call the Claude API, not Ollama.
+claude_model = "claude-opus-4-7"
+min_cluster_size = 3

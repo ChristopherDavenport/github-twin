@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# hatch-vcs writes the resolved version here at build time
+src/github_twin/_version.py
+
+# Local state — do not commit
+config.toml
+.env
+data/
+
+# Claude Code per-machine state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

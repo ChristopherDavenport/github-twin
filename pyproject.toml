@@ -1,0 +1,181 @@
+[project]
+name = "github-twin"
+dynamic = ["version"]
+description = "Personal RAG over your GitHub history (commits, code, review comments), served to Claude Code over MCP."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Christopher Davenport", email = "chris@christopherdavenport.tech" },
+]
+keywords = [
+    "rag",
+    "mcp",
+    "claude-code",
+    "github",
+    "code-search",
+    "embeddings",
+    "sqlite-vec",
+    "tree-sitter",
+    "ollama",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    "anthropic>=0.40.0",
+    "google-genai>=1.0.0",
+    "hdbscan>=0.8.40",
+    "httpx>=0.27.0",
+    "keyring>=24.0",
+    "mcp>=1.0.0",
+    "numpy>=1.26.0",
+    "ollama>=0.4.0",
+    # OTel API only — ships built-in noop tracers when no SDK is configured.
+    # `[otel]` extra brings the SDK + HTTP exporter for real telemetry.
+    "opentelemetry-api>=1.27.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.5.0",
+    "pygments>=2.18.0",
+    "pyyaml>=6.0",
+    "rich>=13.7.0",
+    "scikit-learn>=1.5.0",
+    "sqlite-vec>=0.1.6",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-language-pack>=0.4.0",
+    "typer>=0.12.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ChristopherDavenport/github-twin"
+Repository = "https://github.com/ChristopherDavenport/github-twin"
+Issues = "https://github.com/ChristopherDavenport/github-twin/issues"
+"Getting Started" = "https://github.com/ChristopherDavenport/github-twin/blob/main/getting_started.md"
+
+[project.optional-dependencies]
+# Opt-in sentence-transformers backend for bulk embed throughput at org scale.
+# Install with: `uv sync --extra st` (or `pip install github-twin[st]`).
+st = ["sentence-transformers>=2.7.0"]
+# Opt-in FAISS vector store for sub-second KNN at >1M vectors.
+faiss = ["faiss-cpu>=1.8.0"]
+# Opt-in OpenTelemetry SDK + HTTP exporter. Auto-detects activation from
+# OTEL_EXPORTER_OTLP_*ENDPOINT env vars; nothing fires without them.
+# gRPC users: install `opentelemetry-exporter-otlp-proto-grpc` separately.
+otel = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+
+[project.scripts]
+# Two names for the same Typer app: `gt` for daily shell use, `github-twin`
+# for `uvx github-twin` discovery (uvx looks for a script matching the
+# package name first).
+gt = "github_twin.cli:app"
+github-twin = "github_twin.cli:app"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+    "types-pyyaml>=6.0.12.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+# Version comes from the most recent `v*` git tag (see release workflow).
+# `fallback_version` lets local builds outside a git checkout still produce
+# a wheel — useful when developing inside the source tree without commits.
+# `tag_regex` strips the leading `v` so `v0.1.0` becomes `0.1.0` (PEP 440).
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "no-guess-dev"
+fallback_version = "0.0.0+local"
+tag_regex = "^v?(?P<version>[^+]+)(?P<sep>[+]?)(?P<suffix>.*)$"
+
+# Persist the resolved version into a generated module so the installed
+# package can self-report (`github_twin.__version__`) without re-parsing
+# git history at runtime.
+[tool.hatch.build.hooks.vcs]
+version-file = "src/github_twin/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/github_twin"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length, formatter handles it
+    "B008",  # function call in default — typer.Option(...) is idiomatic
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "embedder: tests that require a real embedder backend (Ollama running)",
+]
+
+# mypy is strict on src/, hands-off on tests/. Strict catches API drift on
+# the package surface; tests are exercise code where over-annotating
+# fixtures fights pytest more than it helps. CI runs `mypy src/github_twin/`
+# explicitly so the tests/ tree never blocks a build.
+[tool.mypy]
+python_version = "3.12"
+files = ["src/github_twin"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_reexport = true
+strict = true
+
+# Third-party packages with no published stubs or whose stubs we don't
+# need. Each entry suppresses the "library stubs not installed" error for
+# that import. Add a new entry rather than a `# type: ignore` at the
+# call site — keeps the type-error budget visible in one place.
+[[tool.mypy.overrides]]
+module = [
+    "tree_sitter",
+    "tree_sitter.*",
+    "tree_sitter_language_pack",
+    "tree_sitter_language_pack.*",
+    "sqlite_vec",
+    "hdbscan",
+    "mcp",
+    "mcp.*",
+    "ollama",
+    "anthropic",
+    "anthropic.*",
+    "google",
+    "google.*",
+    "sentence_transformers",
+    "sklearn",
+    "sklearn.*",
+    "faiss",
+    "opentelemetry.exporter.*",
+    "pygments.*",
+    "keyring",
+    "keyring.*",
+]
+ignore_missing_imports = true
