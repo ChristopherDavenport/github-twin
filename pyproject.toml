@@ -123,6 +123,9 @@ packages = ["src/github_twin"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# hatch-vcs writes _version.py at build time with whichever quote style it
+# prefers; don't lint/format generated output.
+extend-exclude = ["src/github_twin/_version.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
