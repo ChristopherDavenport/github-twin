@@ -78,7 +78,7 @@ jobs:
           attestations: true
         # No `password:` field — Trusted Publishing handles auth via OIDC.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Auto-generate notes from PRs merged since the previous tag.
           # Customize via .github/release.yml when you want category buckets.
