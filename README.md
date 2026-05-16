@@ -66,8 +66,21 @@ Pick whichever is least friction — github-twin tries them in this order:
 
 The MCP server runs over stdio via `github-twin serve` (or `gt serve`).
 Run `uvx github-twin auth login` once on the box that will host the
-server, then add an entry to `~/.claude.json` (or your
-`mcp_servers.json`):
+server.
+
+**Option A — via the Claude Code plugin marketplace** (lowest-friction):
+
+```
+/plugin marketplace add ChristopherDavenport/christopherdavenport-marketplace
+/plugin install github-twin@christopherdavenport
+```
+
+This registers the MCP server entry automatically; set
+`GT_PATHS__DATA_DIR` in your environment (or in `~/.claude.json`'s
+`env` block for this server) to point at the DB directory.
+
+**Option B — manual wiring**: add an entry to `~/.claude.json` (or
+your `mcp_servers.json`):
 
 ```json
 {
@@ -358,6 +371,11 @@ The push to a `v*` tag triggers `.github/workflows/release.yml`, which:
 3. Creates a GitHub Release with auto-generated notes (PRs since the
    previous tag) and attaches the wheel + sdist. Pre-release tags
    (`a/b/rc`) are flagged so they don't replace "Latest".
+4. Bumps `.claude-plugin/plugin.json` on `main` to match the tag —
+   sets `version` and pins the MCP server invocation to
+   `uvx github-twin@X.Y.Z serve`. The marketplace fetches the manifest
+   from HEAD, so this is what users get when their marketplace cache
+   refreshes.
 
 First-time setup, once per repo:
 
