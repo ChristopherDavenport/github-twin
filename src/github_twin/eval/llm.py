@@ -1,0 +1,122 @@
+"""Thin text-completion wrapper for the eval harness.
+
+The distill `RuleSynthesizer` is structured around a JSON-rule contract that
+doesn't fit free-form completions. This module exposes a smaller surface —
+`TextLLM.complete(prompt) -> str` — so eval pipelines can prompt the same
+underlying models (Claude / Gemini / Ollama) for arbitrary text.
+
+Backend selection mirrors `distill/synth.py:make_synthesizer`: Claude when
+`ANTHROPIC_API_KEY` is set, else Gemini when `GEMINI_API_KEY`/`GOOGLE_API_KEY`
+is set, else Ollama. Explicit `prefer=` overrides.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class TextLLM(Protocol):
+    backend_id: str
+
+    def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str: ...
+
+
+class ClaudeText:
+    def __init__(self, *, model: str, api_key: str | None = None) -> None:
+        import anthropic
+
+        self.model = model
+        self.backend_id = f"claude:{model}"
+        self._client = anthropic.Anthropic(api_key=api_key)
+
+    def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
+        from anthropic.types import TextBlock
+
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        # `resp.content` is a union of TextBlock / ThinkingBlock / various
+        # tool-use blocks; only TextBlock has `.text`. isinstance narrows
+        # the type for both runtime safety and mypy.
+        return "".join(b.text for b in resp.content if isinstance(b, TextBlock))
+
+
+class GeminiText:
+    def __init__(self, *, model: str, api_key: str | None = None) -> None:
+        from google import genai
+
+        self.model = model
+        self.backend_id = f"gemini:{model}"
+        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
+        from google.genai import types
+
+        resp = self._client.models.generate_content(
+            model=self.model,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.2,
+                max_output_tokens=max_tokens,
+            ),
+        )
+        return resp.text or ""
+
+
+class OllamaText:
+    def __init__(self, *, model: str, host: str | None = None) -> None:
+        import ollama
+
+        self.model = model
+        self.backend_id = f"ollama:{model}"
+        self._client = ollama.Client(host=host) if host else ollama.Client()
+
+    def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
+        resp = self._client.chat(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            options={"temperature": 0.2, "num_predict": max_tokens},
+        )
+        # ollama-python returns a typed Mapping but mypy can't see it via
+        # `ignore_missing_imports`. The shape is stable; cast to str.
+        content: str = resp["message"]["content"]
+        return content
+
+
+def _has_gemini_key() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+
+
+def make_text_llm(
+    *,
+    claude_model: str = "claude-sonnet-4-6",
+    gemini_model: str = "gemini-2.5-flash",
+    ollama_model: str = "llama3.2",
+    prefer: str = "auto",
+) -> TextLLM:
+    """Mirror of `make_synthesizer`. Same precedence: Claude > Gemini > Ollama."""
+    if prefer == "claude":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        return ClaudeText(model=claude_model)
+    if prefer == "gemini":
+        if not _has_gemini_key():
+            raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
+        return GeminiText(model=gemini_model)
+    if prefer == "ollama":
+        return OllamaText(model=ollama_model)
+    # auto
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return ClaudeText(model=claude_model)
+    if _has_gemini_key():
+        return GeminiText(model=gemini_model)
+    return OllamaText(model=ollama_model)

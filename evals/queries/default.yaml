@@ -1,0 +1,123 @@
+# Default retrieval-quality query bank for github-twin.
+#
+# Tune to your own corpus: run `gt eval search evals/queries/default.yaml`
+# and edit / replace queries that don't match what you care about.
+# Each query is evaluated under bm25-only, vector-only, and hybrid modes.
+#
+# Tier targets enforced by `render_search_result`:
+#   1 — must hit 100% (CLI exits non-zero on miss)
+#   2 — should hit ≥85%
+#   3 — aspirational, ≥70%
+#
+# An `expect_any` clause passes if ANY listed field matches ANY of the
+# top-k returned hits. Fields:
+#   artifact_id, chunk_id      — exact IDs (drift between rebuilds; avoid)
+#   path_substr                — substring in chunk.context.path
+#   text_substr                — case-insensitive substring in chunk.text
+#   url_substr                 — substring in source URL
+#   symbol_name                — exact match on chunk.context.symbol_name
+#   node_kind                  — exact match on chunk.context.node_kind
+
+# ------------- Tier 1: critical, must pass -------------
+
+- query: "renewal of vault secret lease"
+  tool: find_style_examples
+  tier: 1
+  expect_any:
+    - path_substr: "Vault.scala"
+
+- query: "Eq instance for a wrapper case class"
+  tool: find_style_examples
+  tier: 1
+  expect_any:
+    - symbol_name: "VaultSecretEq"        # specific target: the exact wrapper Eq
+    - path_substr: "VaultSecret.scala"    # broader: any chunk from that file
+    - text_substr: "Eq["                  # topical: any Eq typeclass usage
+                                          #   (e.g. `Eq[A]`, `Eq[T]` in cats scaffolding)
+
+- query: "Tracer translate FunctionK natural transformation"
+  tool: find_review_comments
+  tier: 1
+  expect_any:
+    - text_substr: "Tracer.translate"     # exact identifier reference
+    - url_substr: "Tracer"                # comment URL containing "Tracer"
+    - path_substr: "Tracer"               # review comment on a file path containing
+                                          #   "Tracer" (e.g. core/trace/.../Tracer.scala)
+
+- query: "mapN parMapN accumulating errors"
+  tool: find_review_comments
+  tier: 1
+  expect_any:
+    - text_substr: "parMapN"
+    - text_substr: "accumulation"
+
+- query: "ember-core message Parser"
+  tool: find_review_comments
+  tier: 1
+  expect_any:
+    - path_substr: "ember-core"
+
+# ------------- Tier 2: important, should pass -------------
+
+- query: "circuit breaker for http4s client"
+  tool: find_style_examples
+  tier: 2
+  expect_any:
+    - path_substr: "CircuitedClient.scala"
+    - path_substr: "circuit"
+
+- query: "cats-effect Resource lifecycle bracket"
+  tool: find_review_comments
+  tier: 2
+  expect_any:
+    - text_substr: "Resource"
+    - text_substr: "bracket"
+
+- query: "concurrent map ref state"
+  tool: find_review_comments
+  tier: 2
+  expect_any:
+    - text_substr: "Ref"
+    - text_substr: "concurrent"
+
+- query: "binary compatibility scalafix migration"
+  tool: find_review_comments
+  tier: 2
+  expect_any:
+    - text_substr: "binary"
+    - text_substr: "scalafix"
+
+- query: "flaky test munit"
+  tool: find_review_comments
+  tier: 2
+  expect_any:
+    - text_substr: "flake"
+    - text_substr: "munit"
+
+# ------------- Tier 3: nice-to-have, ≥70% -------------
+
+- query: "how should I structure F[_] tagless final code"
+  tool: find_style_examples
+  tier: 3
+  expect_any:
+    - text_substr: "F["
+
+- query: "lock semaphore concurrency primitive"
+  tool: find_review_comments
+  tier: 3
+  expect_any:
+    - text_substr: "lock"
+    - text_substr: "semaphore"
+
+- query: "Stream of secret renewals"
+  tool: find_style_examples
+  tier: 3
+  expect_any:
+    - path_substr: "Vault.scala"
+    - symbol_name: "keep"
+
+- query: "deprecation warning fix"
+  tool: find_review_comments
+  tier: 3
+  expect_any:
+    - text_substr: "deprecation"
