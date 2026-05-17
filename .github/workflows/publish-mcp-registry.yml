@@ -1,0 +1,94 @@
+name: publish to MCP registry
+
+# Fires on the same semver tags as release.yml. Runs AFTER the PyPI publish
+# has happened (gated via `needs:`-style dependency through `workflow_run`
+# would couple two workflows; we keep them independent and have the registry
+# job re-validate that the PyPI artifact is live before submitting).
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+.post[0-9]+"
+
+jobs:
+  publish:
+    name: publish server.json to registry.modelcontextprotocol.io
+    runs-on: ubuntu-latest
+    # OIDC identity for the GitHub-namespace ownership challenge that
+    # registry.modelcontextprotocol.io expects. The token's repo claim is
+    # what the registry verifies against the `io.github.<org>/<repo>` name.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Stamp server.json with tag version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          tag = os.environ["TAG"]
+          assert tag.startswith("v"), tag
+          version = tag[1:]
+
+          p = pathlib.Path("server.json")
+          d = json.loads(p.read_text())
+          d["version"] = version
+          for pkg in d.get("packages", []):
+              pkg["version"] = version
+          p.write_text(json.dumps(d, indent=2) + "\n")
+          PY
+
+      - name: Wait for PyPI to publish the matching version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          # The PyPI publish workflow runs in parallel on the same tag.
+          # Poll for up to 10 minutes so the registry never accepts a
+          # `pypi:github-twin@${version}` reference before pip can install it.
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail "https://pypi.org/pypi/github-twin/${version}/json" > /dev/null; then
+              echo "github-twin@${version} is live on PyPI"
+              exit 0
+            fi
+            echo "attempt ${attempt}: github-twin@${version} not yet on PyPI; sleeping 10s"
+            sleep 10
+          done
+          echo "PyPI never published github-twin@${version} within timeout" >&2
+          exit 1
+
+      - name: Install mcp-publisher
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Resolve the latest mcp-publisher release at workflow time. The
+          # binary is published as a tarball under the
+          # modelcontextprotocol/registry repo's releases. If the registry
+          # ever introduces a breaking schema change, pin a tag here.
+          tag=$(gh release view --repo modelcontextprotocol/registry --json tagName --jq .tagName)
+          version="${tag#v}"
+          echo "Installing mcp-publisher ${version}"
+          curl --silent --fail --location \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${tag}/mcp-publisher_${version}_linux_amd64.tar.gz" \
+            | tar --extract --gzip --directory /usr/local/bin mcp-publisher
+          mcp-publisher --version
+
+      - name: Validate server.json against schema
+        run: mcp-publisher validate server.json
+
+      - name: Log in via GitHub OIDC
+        run: mcp-publisher login github-oidc
+
+      - name: Publish to registry
+        run: mcp-publisher publish
