@@ -34,7 +34,7 @@ def _ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
 
 
 def open_db(db_path: Path, embed_dim: int) -> sqlite3.Connection:
-    """Open SQLite with sqlite-vec loaded, run migrations, return the connection."""
+    """Open SQLite with sqlite-vec loaded, run schema, return the connection."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, isolation_level=None)  # autocommit; we manage txns
     conn.row_factory = sqlite3.Row
@@ -45,7 +45,6 @@ def open_db(db_path: Path, embed_dim: int) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
 
-    _run_pre_schema_migrations(conn)
     with SCHEMA_PATH.open() as f:
         conn.executescript(f.read())
     _ensure_vec_table(conn, embed_dim)
@@ -54,19 +53,12 @@ def open_db(db_path: Path, embed_dim: int) -> sqlite3.Connection:
 
 
 def _backfill_fts(conn: sqlite3.Connection) -> None:
-    """Seed chunk_fts from existing chunk rows on first open after FTS5 lands.
+    """Seed chunk_fts from existing chunk rows when the index is empty.
 
-    Triggers in schema.sql keep chunk_fts in sync for new writes, but DBs that
-    predate this migration have populated chunk rows and a freshly created,
-    empty chunk_fts index. The FTS5 'rebuild' command repopulates the index
-    from the external content table (`chunk`) — the canonical approach for
-    external-content FTS5.
-
-    Detection nuance: `SELECT ... FROM chunk_fts` on an external-content table
-    proxies through to the content table, so it returns rows whenever `chunk`
-    has rows regardless of index state. The actual index population lives in
-    the shadow table `chunk_fts_docsize` — one row per indexed document. We
-    probe that to decide whether a rebuild is needed.
+    Triggers in schema.sql keep chunk_fts in sync for new writes; a brand-new
+    DB never needs this path. The probe lives in `chunk_fts_docsize` (one row
+    per indexed document) — a plain `SELECT ... FROM chunk_fts` proxies through
+    to the content table and would return rows regardless of index state.
     """
     has_chunk = conn.execute("SELECT 1 FROM chunk LIMIT 1").fetchone()
     if has_chunk is None:
@@ -75,95 +67,6 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
     if has_index is not None:
         return
     conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')")
-
-
-def _run_pre_schema_migrations(conn: sqlite3.Connection) -> None:
-    """Add columns to existing tables before schema.sql replays.
-
-    schema.sql is idempotent (CREATE TABLE IF NOT EXISTS) so it won't fix
-    existing tables. Anything that mutates an existing table's shape must run
-    here, *before* schema.sql, so the indexes in schema.sql see the new columns.
-    """
-    chunk_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk'"
-    ).fetchone()
-    if chunk_exists:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunk)").fetchall()}
-        if "language" not in cols:
-            conn.execute("ALTER TABLE chunk ADD COLUMN language TEXT")
-        if "node_kind" not in cols:
-            conn.execute("ALTER TABLE chunk ADD COLUMN node_kind TEXT")
-        if "symbol_name" not in cols:
-            conn.execute("ALTER TABLE chunk ADD COLUMN symbol_name TEXT")
-        if "summary" not in cols:
-            # NL summary written by `gt summarize`. NULL = not yet summarized;
-            # `pending_summary_chunks` filters on it. Embed-time prefix
-            # includes the summary in the chunk header when non-NULL.
-            conn.execute("ALTER TABLE chunk ADD COLUMN summary TEXT")
-
-    # artifact.author_login — needed for org-mode "who wrote this" filtering.
-    artifact_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact'"
-    ).fetchone()
-    if artifact_exists:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(artifact)").fetchall()}
-        if "author_login" not in cols:
-            conn.execute("ALTER TABLE artifact ADD COLUMN author_login TEXT")
-            conn.execute("CREATE INDEX IF NOT EXISTS artifact_author ON artifact(author_login)")
-
-    # repo.last_commits_walked_sha — added when commits ingest moved from the
-    # GitHub API to a local git walk over deep clones. Old org-mode DBs need
-    # the column before schema.sql replays.
-    repo_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='repo'"
-    ).fetchone()
-    if repo_exists:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(repo)").fetchall()}
-        if "last_commits_walked_sha" not in cols:
-            conn.execute("ALTER TABLE repo ADD COLUMN last_commits_walked_sha TEXT")
-
-    # developer_profile_cache — added with the prompt-management tools.
-    # No data migration needed; just create the table if missing.
-    profile_cache_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='developer_profile_cache'"
-    ).fetchone()
-    if not profile_cache_exists:
-        conn.execute(
-            "CREATE TABLE developer_profile_cache ("
-            "login TEXT PRIMARY KEY, "
-            "profile_md TEXT NOT NULL, "
-            "sample_hash TEXT NOT NULL, "
-            "n_samples INTEGER NOT NULL, "
-            "generated_at TEXT NOT NULL)"
-        )
-
-    # identity (singleton, user-mode-only) → target (singleton, kind-discriminated).
-    identity_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity'"
-    ).fetchone()
-    target_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='target'"
-    ).fetchone()
-    if identity_exists and not target_exists:
-        conn.execute(
-            "CREATE TABLE target ("
-            "id INTEGER PRIMARY KEY CHECK (id = 1), "
-            "kind TEXT NOT NULL, "
-            "name TEXT NOT NULL, "
-            "external_id INTEGER NOT NULL, "
-            "emails_json TEXT, "
-            "discovered_at TEXT NOT NULL)"
-        )
-        row = conn.execute(
-            "SELECT username, user_id, emails_json, discovered_at FROM identity"
-        ).fetchone()
-        if row is not None:
-            conn.execute(
-                "INSERT INTO target (id, kind, name, external_id, emails_json, "
-                "discovered_at) VALUES (1, 'user', ?, ?, ?, ?)",
-                (row[0], row[1], row[2], row[3]),
-            )
-        conn.execute("DROP TABLE identity")
 
 
 @contextmanager

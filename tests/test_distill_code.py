@@ -22,6 +22,7 @@ from github_twin.mcp_server import tools as t
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.vector_store import SqliteVecStore
+from tests.conftest import seed_target
 
 
 class FakeEmbedder:
@@ -72,6 +73,7 @@ class FakeSynthesizer:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "code.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -91,6 +93,7 @@ def _seed_code_chunks(
     for i, (text, vec) in enumerate(zip(texts, vecs, strict=True)):
         aid = q.upsert_artifact(
             conn,
+            target_id=1,
             kind="commit",
             external_id=f"{id_prefix}-{i}",
             source_url=f"https://gh/x/commit/{i}",
@@ -216,6 +219,7 @@ def test_distill_writes_code_rules_under_code_rule_chunk_kind(conn):
         synth=synth,
         embedder=embedder,
         cfg=cfg,
+        target_id=1,
         chunk_kind="code",
         rule_chunk_kind="code_rule",
     )
@@ -263,6 +267,7 @@ def test_distill_code_passes_code_shaped_members_to_synth(conn):
         synth=synth,
         embedder=embedder,
         cfg=cfg,
+        target_id=1,
         chunk_kind="code",
         rule_chunk_kind="code_rule",
     )
@@ -306,6 +311,7 @@ def test_find_applicable_rules_returns_only_code_rules(conn):
     # Seed a code-derived rule chunk.
     aid_code = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="rule",
         external_id="rule-code-1",
         source_url=None,
@@ -331,6 +337,7 @@ def test_find_applicable_rules_returns_only_code_rules(conn):
     # if the filter is broken, this leaks into the result.
     aid_rev = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="rule",
         external_id="rule-review-1",
         source_url=None,
@@ -371,6 +378,7 @@ def test_summarize_review_patterns_excludes_code_rules(conn):
     # One review rule.
     aid_rev = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="rule",
         external_id="rev-1",
         source_url=None,
@@ -393,6 +401,7 @@ def test_summarize_review_patterns_excludes_code_rules(conn):
     # One code rule.
     aid_code = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="rule",
         external_id="code-1",
         source_url=None,
@@ -483,6 +492,7 @@ def test_distill_stamps_repo_on_rule(conn):
         synth=synth,
         embedder=embedder,
         cfg=cfg,
+        target_id=1,
         chunk_kind="code",
         rule_chunk_kind="code_rule",
         repo="org/alpha",

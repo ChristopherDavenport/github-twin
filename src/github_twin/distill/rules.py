@@ -92,6 +92,7 @@ def distill_rules(
     synth: RuleSynthesizer,
     embedder: Embedder,
     cfg: DistillCfg,
+    target_id: int,
     author_login: str | None = None,
     chunk_kind: ChunkKind = "review_comment",
     rule_chunk_kind: RuleChunkKind = "rule",
@@ -173,6 +174,7 @@ def distill_rules(
         with transaction(conn):
             artifact_id = q.upsert_artifact(
                 conn,
+                target_id=target_id,
                 kind="rule",
                 external_id=external_id,
                 source_url=None,

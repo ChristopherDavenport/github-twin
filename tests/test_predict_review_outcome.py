@@ -13,6 +13,7 @@ from github_twin.process.chunkers import MAX_PR_BODY_CHARS, chunk_pr_summary
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.vector_store import SqliteVecStore
+from tests.conftest import seed_target
 
 # ---------- chunker ----------
 
@@ -83,6 +84,7 @@ class FakeEmbedder:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "pred.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -98,6 +100,7 @@ def _seed_pr(
 ) -> int:
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="pr",
         external_id=f"me/x#{pr_num}",
         source_url=f"https://gh/x/{pr_num}",

@@ -94,10 +94,14 @@ def test_mcp_tool_call_does_not_write_to_stdout(monkeypatch: pytest.MonkeyPatch,
         def embed(self, texts):
             return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
 
+    from tests.conftest import seed_target
+
     db = open_db(tmp_path / "obs.sqlite", embed_dim=4)
+    seed_target(db)
     try:
         aid = q.upsert_artifact(
             db,
+            target_id=1,
             kind="commit",
             external_id="a-1",
             source_url=None,

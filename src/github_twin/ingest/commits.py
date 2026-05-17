@@ -76,6 +76,7 @@ def _write_commit_artifact(
     *,
     conn: sqlite3.Connection,
     cfg: IngestCfg,
+    target_id: int,
     repo_full: str,
     sha: str,
     diff: str,
@@ -89,6 +90,7 @@ def _write_commit_artifact(
     """Persist one commit (artifact + chunks). Common to both ingest paths."""
     artifact_id = q.upsert_artifact(
         conn,
+        target_id=target_id,
         kind="commit",
         external_id=sha,
         source_url=url,
@@ -209,6 +211,7 @@ def _walk_repo_local(
     conn: sqlite3.Connection,
     gh: GitHubClient | None,
     cfg: IngestCfg,
+    target_id: int,
     repo_full: str,
     clone_path: Path,
     head_sha: str,
@@ -248,6 +251,7 @@ def _walk_repo_local(
         _write_commit_artifact(
             conn=conn,
             cfg=cfg,
+            target_id=target_id,
             repo_full=repo_full,
             sha=row.sha,
             diff=diff,
@@ -297,6 +301,7 @@ def ingest_commits(
     username: str,
     emails: list[str],
     cfg: IngestCfg,
+    target_id: int,
     since: str | None = None,
     limit: int | None = None,
 ) -> CommitStats:
@@ -307,6 +312,7 @@ def ingest_commits(
             username=username,
             emails=emails,
             cfg=cfg,
+            target_id=target_id,
             limit=limit,
         )
     return _ingest_commits_api(
@@ -316,6 +322,7 @@ def ingest_commits(
         username=username,
         emails=emails,
         cfg=cfg,
+        target_id=target_id,
         since=since,
         limit=limit,
     )
@@ -328,6 +335,7 @@ def _ingest_commits_local(
     username: str,
     emails: list[str],
     cfg: IngestCfg,
+    target_id: int,
     limit: int | None,
 ) -> CommitStats:
     stats = CommitStats()
@@ -338,7 +346,7 @@ def _ingest_commits_local(
     for repo_full in repos:
         if not _allowed_repo(repo_full, cfg):
             continue
-        existing = q.get_repo(conn, repo_full)
+        existing = q.get_repo(conn, target_id=target_id, full_name=repo_full)
         last_walked = existing.get("last_commits_walked_sha") if existing else None
         try:
             with commits_clone(repo_full, cache_dir=cfg.clones_dir) as clone:
@@ -346,6 +354,7 @@ def _ingest_commits_local(
                 if existing is None:
                     q.upsert_repo(
                         conn,
+                        target_id=target_id,
                         full_name=repo_full,
                         default_branch=None,
                         pushed_at=None,
@@ -355,6 +364,7 @@ def _ingest_commits_local(
                     conn=conn,
                     gh=gh,
                     cfg=cfg,
+                    target_id=target_id,
                     repo_full=repo_full,
                     clone_path=clone.path,
                     head_sha=clone.head_sha,
@@ -366,6 +376,7 @@ def _ingest_commits_local(
                 )
                 q.set_repo_cursor(
                     conn,
+                    target_id=target_id,
                     full_name=repo_full,
                     commits_walked_sha=clone.head_sha,
                     commits_at=_now_iso(),
@@ -385,6 +396,7 @@ def ingest_commits_org(
     gh: GitHubClient,
     cache: RawCache,
     cfg: IngestCfg,
+    target_id: int,
     limit_per_repo: int | None = None,
 ) -> CommitStats:
     """Walk every repo's commits since its per-repo cursor.
@@ -396,6 +408,7 @@ def ingest_commits_org(
             conn=conn,
             gh=gh,
             cfg=cfg,
+            target_id=target_id,
             limit_per_repo=limit_per_repo,
         )
     return _ingest_commits_org_api(
@@ -403,6 +416,7 @@ def ingest_commits_org(
         gh=gh,
         cache=cache,
         cfg=cfg,
+        target_id=target_id,
         limit_per_repo=limit_per_repo,
     )
 
@@ -412,10 +426,11 @@ def _ingest_commits_org_local(
     conn: sqlite3.Connection,
     gh: GitHubClient,
     cfg: IngestCfg,
+    target_id: int,
     limit_per_repo: int | None,
 ) -> CommitStats:
     stats = CommitStats()
-    for row in q.list_repos(conn):
+    for row in q.list_repos(conn, target_id=target_id):
         repo_full = row["full_name"]
         if not _allowed_repo(repo_full, cfg):
             continue
@@ -427,6 +442,7 @@ def _ingest_commits_org_local(
                     conn=conn,
                     gh=gh,
                     cfg=cfg,
+                    target_id=target_id,
                     repo_full=repo_full,
                     clone_path=clone.path,
                     head_sha=clone.head_sha,
@@ -438,6 +454,7 @@ def _ingest_commits_org_local(
                 )
                 q.set_repo_cursor(
                     conn,
+                    target_id=target_id,
                     full_name=repo_full,
                     commits_walked_sha=clone.head_sha,
                     commits_at=_now_iso(),
@@ -492,10 +509,11 @@ def _ingest_commits_api(
     username: str,
     emails: list[str],
     cfg: IngestCfg,
+    target_id: int,
     since: str | None = None,
     limit: int | None = None,
 ) -> CommitStats:
-    cursor = since or q.get_cursor(conn, "commits") or cfg.since
+    cursor = since or q.get_cursor(conn, "commits", target_id=target_id) or cfg.since
     log.info("ingesting commits (api) since %s", cursor)
     stats = CommitStats()
 
@@ -525,6 +543,7 @@ def _ingest_commits_api(
         _write_commit_artifact(
             conn=conn,
             cfg=cfg,
+            target_id=target_id,
             repo_full=repo_full,
             sha=sha,
             diff=diff,
@@ -538,7 +557,7 @@ def _ingest_commits_api(
 
     if newest and stats.fetched > 0:
         bumped = _bump_iso(newest)
-        q.set_cursor(conn, "commits", bumped)
+        q.set_cursor(conn, "commits", bumped, target_id=target_id)
     return stats
 
 
@@ -579,10 +598,11 @@ def _ingest_commits_org_api(
     gh: GitHubClient,
     cache: RawCache,
     cfg: IngestCfg,
+    target_id: int,
     limit_per_repo: int | None = None,
 ) -> CommitStats:
     stats = CommitStats()
-    for row in q.list_repos(conn):
+    for row in q.list_repos(conn, target_id=target_id):
         repo_full = row["full_name"]
         cursor = row.get("last_commits_at") or cfg.since
         log.info("commits org (api): %s since %s", repo_full, cursor)
@@ -606,6 +626,7 @@ def _ingest_commits_org_api(
             _write_commit_artifact(
                 conn=conn,
                 cfg=cfg,
+                target_id=target_id,
                 repo_full=repo_full,
                 sha=sha,
                 diff=diff,
@@ -616,5 +637,5 @@ def _ingest_commits_org_api(
                 url=item.get("html_url"),
                 stats=stats,
             )
-        q.set_repo_cursor(conn, full_name=repo_full, commits_at=_now_iso())
+        q.set_repo_cursor(conn, target_id=target_id, full_name=repo_full, commits_at=_now_iso())
     return stats

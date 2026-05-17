@@ -9,11 +9,13 @@ import pytest
 
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "fts.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -21,6 +23,7 @@ def conn(tmp_path: Path):
 def _insert(conn, *, text):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id=f"x-{text}",
         source_url=None,
@@ -80,6 +83,7 @@ def test_open_db_backfills_fts_from_existing_chunks(tmp_path: Path):
 
     # Seed with the normal pipeline.
     conn = open_db(db_path, embed_dim=4)
+    seed_target(conn)
     _insert(conn, text="alpha bravo charlie")
     _insert(conn, text="delta echo foxtrot")
     conn.close()
@@ -112,6 +116,7 @@ def test_open_db_backfill_is_idempotent(tmp_path: Path):
     """Reopening a DB that already has chunk_fts populated does nothing."""
     db_path = tmp_path / "idempotent.sqlite"
     conn = open_db(db_path, embed_dim=4)
+    seed_target(conn)
     _insert(conn, text="some content")
     n_before = conn.execute("SELECT COUNT(*) AS n FROM chunk_fts").fetchone()["n"]
     conn.close()

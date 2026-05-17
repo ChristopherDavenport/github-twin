@@ -4,11 +4,13 @@ import pytest
 
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -25,9 +27,11 @@ def _seed_chunk(
     author_login=None,
     node_kind=None,
     symbol_name=None,
+    target_id=1,
 ):
     aid = q.upsert_artifact(
         conn,
+        target_id=target_id,
         kind="commit" if kind == "code" else "review_comment",
         external_id=f"{kind}-{text}",
         source_url=None,
@@ -246,10 +250,8 @@ def test_vector_search_kind_filter(conn):
 
 
 def test_vector_search_finds_rare_kind_among_many(conn):
-    """Regression: when one kind dominates the index (e.g. lots of code, few
-    review_comments), the rare kind must still be retrievable. Earlier the
-    KNN ran unfiltered and the post-filter dropped everything."""
-    # 50 'code' chunks clustered near the query
+    """Regression: when one kind dominates the index, the rare kind must still
+    be retrievable."""
     for i in range(50):
         _seed_chunk(
             conn,
@@ -258,7 +260,6 @@ def test_vector_search_finds_rare_kind_among_many(conn):
             text=f"code-{i}",
             vec=[1.0, 0.01 * i, 0.0, 0.0],
         )
-    # 2 'review_comment' chunks, slightly farther from the query
     _seed_chunk(
         conn,
         kind="review_comment",
@@ -281,6 +282,7 @@ def test_vector_search_finds_rare_kind_among_many(conn):
 def test_upsert_artifact_is_idempotent(conn):
     aid1 = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="sha1",
         source_url=None,
@@ -293,6 +295,7 @@ def test_upsert_artifact_is_idempotent(conn):
     )
     aid2 = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="sha1",
         source_url="new",
@@ -320,6 +323,7 @@ def test_delete_chunks_for_artifact_clears_vectors(conn):
 def test_pending_embed_chunks_skips_already_embedded(conn):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="x",
         source_url=None,
@@ -339,36 +343,48 @@ def test_pending_embed_chunks_skips_already_embedded(conn):
 
 
 def test_cursor_roundtrip(conn):
+    # Global cursor (default target_id=0).
     assert q.get_cursor(conn, "commits") is None
     q.set_cursor(conn, "commits", "2024-01-01T00:00:00+00:00")
     assert q.get_cursor(conn, "commits") == "2024-01-01T00:00:00+00:00"
-    q.set_cursor(conn, "commits", "2024-06-01T00:00:00+00:00")
-    assert q.get_cursor(conn, "commits") == "2024-06-01T00:00:00+00:00"
+    # Per-target cursor doesn't collide with the global one.
+    assert q.get_cursor(conn, "commits", target_id=1) is None
+    q.set_cursor(conn, "commits", "2024-06-01T00:00:00+00:00", target_id=1)
+    assert q.get_cursor(conn, "commits", target_id=1) == "2024-06-01T00:00:00+00:00"
+    assert q.get_cursor(conn, "commits") == "2024-01-01T00:00:00+00:00"
 
 
 def test_target_roundtrip_user(conn):
-    assert q.get_target(conn) is None
-    q.upsert_target(conn, kind="user", name="me", external_id=42, emails=["a@b", "c@d"])
-    t = q.get_target(conn)
-    assert t["kind"] == "user"
-    assert t["name"] == "me"
-    assert t["external_id"] == 42
-    assert t["emails"] == ["a@b", "c@d"]
-
-
-def test_target_roundtrip_org(conn):
+    # The conftest fixture already seeded a user target (id=1).
+    rows = q.get_all_targets(conn)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "user"
+    # Adding a second org target appends, doesn't overwrite.
     q.upsert_target(conn, kind="org", name="typelevel", external_id=1234, emails=None)
-    t = q.get_target(conn)
-    assert t["kind"] == "org"
-    assert t["name"] == "typelevel"
-    assert t["external_id"] == 1234
-    assert t["emails"] is None
+    rows = q.get_all_targets(conn)
+    assert {r["kind"] for r in rows} == {"user", "org"}
+
+
+def test_target_roundtrip_org(tmp_path: Path):
+    # Fresh DB (no autoseeded user).
+    db = open_db(tmp_path / "org.sqlite", embed_dim=4)
+    try:
+        tid = q.upsert_target(db, kind="org", name="typelevel", external_id=1234, emails=None)
+        row = q.get_target_by_id(db, tid)
+        assert row is not None
+        assert row["kind"] == "org"
+        assert row["name"] == "typelevel"
+        assert row["external_id"] == 1234
+        assert row["emails_json"] is None
+    finally:
+        db.close()
 
 
 def test_repo_upsert_and_list(conn):
     assert q.list_repos(conn) == []
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r1",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -378,6 +394,7 @@ def test_repo_upsert_and_list(conn):
     )
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r2",
         default_branch="main",
         pushed_at="2024-02-01T00:00:00Z",
@@ -387,6 +404,7 @@ def test_repo_upsert_and_list(conn):
     )
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r3",
         default_branch="main",
         pushed_at="2024-03-01T00:00:00Z",
@@ -394,13 +412,10 @@ def test_repo_upsert_and_list(conn):
         fork=True,
         size_kb=30,
     )
-    # Default filters: no archived, no forks.
     repos = q.list_repos(conn)
     assert [r["full_name"] for r in repos] == ["org/r1"]
-    # With archived included.
     repos = q.list_repos(conn, include_archived=True)
     assert {r["full_name"] for r in repos} == {"org/r1", "org/r2"}
-    # Everything.
     repos = q.list_repos(conn, include_archived=True, include_forks=True)
     assert {r["full_name"] for r in repos} == {"org/r1", "org/r2", "org/r3"}
 
@@ -408,17 +423,17 @@ def test_repo_upsert_and_list(conn):
 def test_set_repo_cursor_is_partial(conn):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
     )
-    q.set_repo_cursor(conn, full_name="org/r", files_at="2024-01-02T00:00:00Z")
-    r = q.get_repo(conn, "org/r")
+    q.set_repo_cursor(conn, target_id=1, full_name="org/r", files_at="2024-01-02T00:00:00Z")
+    r = q.get_repo(conn, target_id=1, full_name="org/r")
     assert r["last_files_at"] == "2024-01-02T00:00:00Z"
-    assert r["last_commits_at"] is None  # unchanged
-    # Subsequent partial update doesn't clobber files_at
-    q.set_repo_cursor(conn, full_name="org/r", commits_at="2024-01-03T00:00:00Z")
-    r = q.get_repo(conn, "org/r")
+    assert r["last_commits_at"] is None
+    q.set_repo_cursor(conn, target_id=1, full_name="org/r", commits_at="2024-01-03T00:00:00Z")
+    r = q.get_repo(conn, target_id=1, full_name="org/r")
     assert r["last_files_at"] == "2024-01-02T00:00:00Z"
     assert r["last_commits_at"] == "2024-01-03T00:00:00Z"
 
@@ -428,3 +443,49 @@ def test_open_db_rejects_wrong_dim(tmp_path: Path):
     open_db(db_path, embed_dim=4).close()
     with pytest.raises(RuntimeError, match="different embedding dimension"):
         open_db(db_path, embed_dim=8)
+
+
+def test_coalesce_dedupes_same_external_id_across_targets(tmp_path: Path):
+    """A commit ingested under two targets surfaces once in coalesce mode."""
+    db = open_db(tmp_path / "multi.sqlite", embed_dim=4)
+    try:
+        t1 = seed_target(db, kind="user", name="me", external_id=1)
+        t2 = seed_target(db, kind="org", name="acme", external_id=2)
+        for tid in (t1, t2):
+            aid = q.upsert_artifact(
+                db,
+                target_id=tid,
+                kind="commit",
+                external_id="shared-sha",
+                source_url=None,
+                repo="acme/lib",
+                language="python",
+                author_email=None,
+                author_login="me",
+                created_at="2024-01-01",
+                decision=None,
+                meta=None,
+            )
+            cid = q.insert_chunk(
+                db,
+                artifact_id=aid,
+                kind="code",
+                text="shared body",
+                context={"language": "python"},
+                language="python",
+            )
+            q.write_embedding(db, chunk_id=cid, embedding=[1.0, 0.0, 0.0, 0.0], model_id="m")
+        # Coalesce mode (no target_id) dedupes.
+        hits = q.vector_search(db, query_vec=[1.0, 0.0, 0.0, 0.0], chunk_kind="code", k=5)
+        assert len(hits) == 1
+        # Narrow modes return only that target's row.
+        hits_t1 = q.vector_search(
+            db, query_vec=[1.0, 0.0, 0.0, 0.0], chunk_kind="code", target_id=t1, k=5
+        )
+        hits_t2 = q.vector_search(
+            db, query_vec=[1.0, 0.0, 0.0, 0.0], chunk_kind="code", target_id=t2, k=5
+        )
+        assert len(hits_t1) == 1 and hits_t1[0].target_id == t1
+        assert len(hits_t2) == 1 and hits_t2[0].target_id == t2
+    finally:
+        db.close()

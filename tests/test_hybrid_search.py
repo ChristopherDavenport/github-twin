@@ -17,6 +17,7 @@ from github_twin.store.vector_store import (
     VectorSearchFilters,
     hybrid_search,
 )
+from tests.conftest import seed_target
 
 
 class FakeEmbedder:
@@ -43,6 +44,7 @@ class FakeEmbedder:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "hybrid.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -50,6 +52,7 @@ def conn(tmp_path: Path):
 def _seed(conn, *, text, vec):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id=f"code-{text}",
         source_url=None,
@@ -217,6 +220,7 @@ def test_hybrid_respects_filters(conn):
     """Filters must apply to BOTH retriever legs."""
     aid_py = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="py",
         source_url=None,
@@ -240,6 +244,7 @@ def test_hybrid_respects_filters(conn):
 
     aid_go = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="go",
         source_url=None,

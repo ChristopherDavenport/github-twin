@@ -1,25 +1,45 @@
 -- github-twin schema. Idempotent: every statement is CREATE ... IF NOT EXISTS.
 -- vec_chunk is a virtual table (sqlite-vec); its dimension is parameterized at runtime.
+--
+-- Multi-target: one DB can hold N targets (user + orgs + repos). Every
+-- per-target row carries `target_id`. Coalesced reads (target_id IS NULL
+-- at the filter level) dedupe via (artifact.kind, artifact.external_id,
+-- chunk.chunk_idx) so commits ingested under multiple targets don't
+-- double-count.
+
+CREATE TABLE IF NOT EXISTS target (
+  id            INTEGER PRIMARY KEY,
+  kind          TEXT NOT NULL,          -- 'user' | 'org' | 'repo'
+  name          TEXT NOT NULL,          -- username, org login, or 'owner/name'
+  external_id   INTEGER NOT NULL,       -- numeric GitHub id
+  emails_json   TEXT,                   -- user-mode only; NULL for org/repo
+  discovered_at TEXT NOT NULL,
+  UNIQUE(kind, name)
+);
 
 CREATE TABLE IF NOT EXISTS artifact (
   id           INTEGER PRIMARY KEY,
+  target_id    INTEGER NOT NULL REFERENCES target(id) ON DELETE CASCADE,
   kind         TEXT NOT NULL,        -- 'commit' | 'pr' | 'review_comment' | 'issue_comment' | 'file' | 'rule'
   external_id  TEXT,                  -- commit SHA, PR node id, comment id, etc.
   source_url   TEXT,
   repo         TEXT,
   language     TEXT,
   author_email TEXT,
-  author_login TEXT,                  -- GH login; populated in org-mode (added O-A)
+  author_login TEXT,                  -- GH login; populated in org-mode
   created_at   TEXT,                  -- ISO8601
   decision     TEXT,                  -- 'approved' | 'changes_requested' | 'commented' | NULL
   meta_json    TEXT,
-  UNIQUE(kind, external_id)
+  UNIQUE(target_id, kind, external_id)
 );
 
+CREATE INDEX IF NOT EXISTS artifact_target ON artifact(target_id);
 CREATE INDEX IF NOT EXISTS artifact_kind_lang ON artifact(kind, language);
 CREATE INDEX IF NOT EXISTS artifact_decision ON artifact(decision) WHERE decision IS NOT NULL;
 CREATE INDEX IF NOT EXISTS artifact_repo ON artifact(repo);
 CREATE INDEX IF NOT EXISTS artifact_author ON artifact(author_login);
+-- Coalesce dedup leans on this composite for cheap GROUP BY / DISTINCT.
+CREATE INDEX IF NOT EXISTS artifact_dedup ON artifact(kind, external_id);
 
 CREATE TABLE IF NOT EXISTS chunk (
   id           INTEGER PRIMARY KEY,
@@ -62,25 +82,22 @@ CREATE TRIGGER IF NOT EXISTS chunk_au AFTER UPDATE ON chunk BEGIN
   INSERT INTO chunk_fts(rowid, text) VALUES (new.id, new.text);
 END;
 
+-- Per-target cursors plus a global tier (target_id=0) for cross-target
+-- resources like `embed_text_version`.
 CREATE TABLE IF NOT EXISTS sync_cursor (
-  resource   TEXT PRIMARY KEY,
+  target_id  INTEGER NOT NULL,
+  resource   TEXT NOT NULL,
   cursor     TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (target_id, resource)
 );
 
--- One row, kind discriminates user-mode vs org-mode targets.
-CREATE TABLE IF NOT EXISTS target (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  kind          TEXT NOT NULL,          -- 'user' | 'org' | 'repo'
-  name          TEXT NOT NULL,          -- username or org login
-  external_id   INTEGER NOT NULL,       -- numeric GitHub id
-  emails_json   TEXT,                   -- user-mode only; NULL for org
-  discovered_at TEXT NOT NULL
-);
-
--- Per-repo state for org-mode ingest: discovered, cloned, walked.
+-- Per-repo state for org-mode / repo-mode ingest: discovered, cloned, walked.
+-- (target_id, full_name) is unique so two targets can hold the same repo
+-- with their own walk cursors.
 CREATE TABLE IF NOT EXISTS repo (
-  full_name               TEXT PRIMARY KEY,  -- 'owner/name'
+  target_id               INTEGER NOT NULL REFERENCES target(id) ON DELETE CASCADE,
+  full_name               TEXT NOT NULL,  -- 'owner/name'
   default_branch          TEXT,
   head_sha                TEXT,              -- last indexed default-branch SHA
   pushed_at               TEXT,              -- from /repos response; skip if <= last_files_at
@@ -90,14 +107,17 @@ CREATE TABLE IF NOT EXISTS repo (
   last_files_at           TEXT,              -- last successful file walk
   last_commits_at         TEXT,              -- last successful commits cursor (wall-clock)
   last_commits_walked_sha TEXT,              -- HEAD sha at end of last commits walk (git-local path)
-  last_reviews_at         TEXT               -- last successful reviews cursor
+  last_reviews_at         TEXT,              -- last successful reviews cursor
+  PRIMARY KEY (target_id, full_name)
 );
 
 CREATE INDEX IF NOT EXISTS repo_pushed_at ON repo(pushed_at);
+CREATE INDEX IF NOT EXISTS repo_full_name ON repo(full_name);
 
 -- email → GitHub login cache. Populated lazily during git-local commits
 -- ingest; misses (login IS NULL) are cached too so we don't re-query
--- unresolvable addresses.
+-- unresolvable addresses. Global across targets — an email's mapping
+-- doesn't change between orgs.
 CREATE TABLE IF NOT EXISTS email_login_map (
   email       TEXT PRIMARY KEY,             -- lowercased
   login       TEXT,                          -- NULL if no linked GH account found
@@ -105,13 +125,13 @@ CREATE TABLE IF NOT EXISTS email_login_map (
   source      TEXT NOT NULL                  -- 'search_commits' | 'noreply' | 'manual'
 );
 
--- Cached output of the `developer_profile` MCP tool. One row per author
--- login; sample_hash invalidates the cache when the set of recent review
--- comments changes (e.g. after a fresh `gt sync`). The MCP tool computes
--- the current sample_hash from chunk_ids of the N most-recent reviews and
--- compares; on mismatch it re-synthesizes and overwrites this row.
+-- Cached output of the `developer_profile` MCP tool. Cache key is a
+-- composite string built by `_profile_cache_key` that already folds in
+-- author / language / repo / target so we don't need separate columns
+-- for them. The hash invalidates on any change to the underlying sample
+-- set.
 CREATE TABLE IF NOT EXISTS developer_profile_cache (
-  login        TEXT PRIMARY KEY,             -- author login, or '__target__' for user-mode default
+  login        TEXT PRIMARY KEY,             -- composite cache key (see _profile_cache_key)
   profile_md   TEXT NOT NULL,
   sample_hash  TEXT NOT NULL,                -- sha1(sorted comment chunk_ids)
   n_samples    INTEGER NOT NULL,

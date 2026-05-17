@@ -21,6 +21,7 @@ from github_twin.distill.synth import (
 from github_twin.embed.base import Embedder
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 # ---------- helpers ----------
 
@@ -72,6 +73,7 @@ class FakeSynthesizer:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -90,6 +92,7 @@ def _seed_review_chunks(
     for i, (text, vec) in enumerate(zip(texts, vecs, strict=True)):
         aid = q.upsert_artifact(
             conn,
+            target_id=1,
             kind="review_comment",
             external_id=f"{id_prefix}-{i}",
             source_url=f"https://example/{i}",
@@ -195,7 +198,7 @@ def test_distill_writes_rules_and_makes_them_retrievable(conn):
     _seed_review_chunks(conn, texts, embedder)
     synth = FakeSynthesizer()
     cfg = DistillCfg(min_cluster_size=3)
-    stats = distill_rules(conn=conn, synth=synth, embedder=embedder, cfg=cfg)
+    stats = distill_rules(conn=conn, synth=synth, embedder=embedder, cfg=cfg, target_id=1)
     assert stats.clusters == 2
     assert stats.rules_written == 2
     rules = q.list_rules(conn)
@@ -222,7 +225,7 @@ def test_distill_skips_incoherent_clusters(conn):
         }
     )
     cfg = DistillCfg(min_cluster_size=3)
-    stats = distill_rules(conn=conn, synth=synth, embedder=embedder, cfg=cfg)
+    stats = distill_rules(conn=conn, synth=synth, embedder=embedder, cfg=cfg, target_id=1)
     assert stats.clusters == 2
     assert stats.rules_written == 0
     assert stats.incoherent == 2
@@ -334,6 +337,7 @@ def test_distill_stamps_author_login_on_rule(conn):
         synth=FakeSynthesizer(),
         embedder=embedder,
         cfg=cfg,
+        target_id=1,
         author_login="alice",
     )
     assert stats.rules_written >= 1
@@ -351,9 +355,9 @@ def test_distill_idempotent_external_ids(conn):
         embedder,
     )
     cfg = DistillCfg(min_cluster_size=3)
-    distill_rules(conn=conn, synth=FakeSynthesizer(), embedder=embedder, cfg=cfg)
+    distill_rules(conn=conn, synth=FakeSynthesizer(), embedder=embedder, cfg=cfg, target_id=1)
     n1 = conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='rule'").fetchone()[0]
-    distill_rules(conn=conn, synth=FakeSynthesizer(), embedder=embedder, cfg=cfg)
+    distill_rules(conn=conn, synth=FakeSynthesizer(), embedder=embedder, cfg=cfg, target_id=1)
     n2 = conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='rule'").fetchone()[0]
     assert n1 == n2 == 2
 

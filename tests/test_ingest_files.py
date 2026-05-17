@@ -16,11 +16,13 @@ from github_twin.ingest import files as files_mod
 from github_twin.ingest.clone import ClonedRepo
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -61,6 +63,7 @@ def test_ingest_files_walks_one_repo(tmp_path: Path, conn, monkeypatch):
 
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/repo",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -71,7 +74,7 @@ def test_ingest_files_walks_one_repo(tmp_path: Path, conn, monkeypatch):
     _patch_clone_to_local(monkeypatch, worktree)
 
     cfg = IngestCfg()
-    stats = files_mod.ingest_files(conn=conn, cfg=cfg)
+    stats = files_mod.ingest_files(conn=conn, cfg=cfg, target_id=1)
 
     assert stats.repos_visited == 1
     assert stats.repos_skipped == 0
@@ -95,7 +98,7 @@ def test_ingest_files_walks_one_repo(tmp_path: Path, conn, monkeypatch):
     assert all(c["language"] == "python" for c in chunks)
 
     # The repo cursor advanced.
-    row = q.get_repo(conn, "org/repo")
+    row = q.get_repo(conn, target_id=1, full_name="org/repo")
     assert row["head_sha"] == "deadbeef"
     assert row["last_files_at"] is not None
 
@@ -104,6 +107,7 @@ def test_ingest_files_skips_unchanged_repo(tmp_path: Path, conn, monkeypatch):
     """If pushed_at <= last_files_at we shouldn't even open a clone."""
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/cold",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -113,6 +117,7 @@ def test_ingest_files_skips_unchanged_repo(tmp_path: Path, conn, monkeypatch):
     )
     q.set_repo_cursor(
         conn,
+        target_id=1,
         full_name="org/cold",
         files_at="2024-06-01T00:00:00Z",
     )
@@ -126,7 +131,7 @@ def test_ingest_files_skips_unchanged_repo(tmp_path: Path, conn, monkeypatch):
 
     monkeypatch.setattr(files_mod, "cloned_repo", boom)
 
-    stats = files_mod.ingest_files(conn=conn, cfg=IngestCfg())
+    stats = files_mod.ingest_files(conn=conn, cfg=IngestCfg(), target_id=1)
     assert stats.repos_visited == 0
     assert stats.repos_skipped == 1
     assert called["n"] == 0
@@ -135,6 +140,7 @@ def test_ingest_files_skips_unchanged_repo(tmp_path: Path, conn, monkeypatch):
 def test_ingest_files_skips_oversize_repo(tmp_path: Path, conn, monkeypatch):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/huge",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -147,7 +153,7 @@ def test_ingest_files_skips_oversize_repo(tmp_path: Path, conn, monkeypatch):
         "cloned_repo",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not clone")),
     )
-    stats = files_mod.ingest_files(conn=conn, cfg=IngestCfg(max_repo_size_kb=500_000))
+    stats = files_mod.ingest_files(conn=conn, cfg=IngestCfg(max_repo_size_kb=500_000), target_id=1)
     assert stats.repos_visited == 0
     assert stats.repos_skipped == 1
 
@@ -160,6 +166,7 @@ def test_ingest_files_is_idempotent(tmp_path: Path, conn, monkeypatch):
 
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/repo",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -168,15 +175,15 @@ def test_ingest_files_is_idempotent(tmp_path: Path, conn, monkeypatch):
     _patch_clone_to_local(monkeypatch, worktree)
 
     # First pass.
-    files_mod.ingest_files(conn=conn, cfg=IngestCfg())
+    files_mod.ingest_files(conn=conn, cfg=IngestCfg(), target_id=1)
     n_art1 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     n_chunk1 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
 
     # Reset the cursor so the skip-if-unchanged check doesn't short-circuit
-    # the second run — we want to verify upsert semantics, not skip behavior.
+    # the second run.
     conn.execute("UPDATE repo SET last_files_at = NULL WHERE full_name='org/repo'")
 
-    files_mod.ingest_files(conn=conn, cfg=IngestCfg())
+    files_mod.ingest_files(conn=conn, cfg=IngestCfg(), target_id=1)
     n_art2 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     n_chunk2 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
 

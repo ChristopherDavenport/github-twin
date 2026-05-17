@@ -12,11 +12,13 @@ import pytest
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.queries import _fts_escape
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -38,6 +40,7 @@ def _seed_chunk(
     _SEED_COUNTER["n"] += 1
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit" if kind == "code" else "review_comment",
         external_id=f"{kind}-{_SEED_COUNTER['n']}",
         source_url=None,

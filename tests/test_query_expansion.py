@@ -145,7 +145,10 @@ class _StubExpander:
 
 @pytest.fixture
 def conn(tmp_path: Path):
+    from tests.conftest import seed_target
+
     db = open_db(tmp_path / "expansion.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -153,6 +156,7 @@ def conn(tmp_path: Path):
 def _seed_chunk(conn, *, text: str, language: str = "python") -> int:
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id=f"e-{text}",
         source_url=None,

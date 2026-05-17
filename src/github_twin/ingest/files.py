@@ -98,10 +98,11 @@ def ingest_files(
     *,
     conn: sqlite3.Connection,
     cfg: IngestCfg,
+    target_id: int,
     limit: int | None = None,
 ) -> FilesStats:
     stats = FilesStats()
-    repos = q.list_repos(conn)
+    repos = q.list_repos(conn, target_id=target_id)
     if limit is not None:
         repos = repos[:limit]
     cache_dir: Path | None = Path(cfg.clones_dir) if cfg.cache_clones else None
@@ -122,10 +123,12 @@ def ingest_files(
                     full_name=full_name,
                     head_sha=clone.head_sha,
                     cfg=cfg,
+                    target_id=target_id,
                 )
             with transaction(conn):
                 q.set_repo_cursor(
                     conn,
+                    target_id=target_id,
                     full_name=full_name,
                     head_sha=clone.head_sha,
                     files_at=_now_iso(),
@@ -155,6 +158,7 @@ def _ingest_one_repo(
     full_name: str,
     head_sha: str,
     cfg: IngestCfg,
+    target_id: int,
 ) -> tuple[int, int]:
     """Walk a single clone, write `kind='file'` artifacts + chunks. Returns
     (files_chunked, chunks_written). Runs inside its own transaction so a
@@ -189,6 +193,7 @@ def _ingest_one_repo(
 
             artifact_id = q.upsert_artifact(
                 conn,
+                target_id=target_id,
                 kind="file",
                 external_id=f"{full_name}:{rel}",
                 source_url=url,
