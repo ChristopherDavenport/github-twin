@@ -23,11 +23,13 @@ from github_twin.ingest.clone import ClonedRepo
 from github_twin.ingest.commits import ingest_commits, ingest_commits_org
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -109,6 +111,7 @@ def test_user_mode_walks_only_matching_emails(conn, monkeypatch, tmp_git_repo):
         username="me",
         emails=["me@example.com"],
         cfg=IngestCfg(since="2020-01-01"),
+        target_id=1,
     )
 
     assert stats.fetched == 1
@@ -141,9 +144,10 @@ def test_user_mode_persists_walked_sha(conn, monkeypatch, tmp_git_repo):
         username="me",
         emails=["me@example.com"],
         cfg=IngestCfg(since="2020-01-01"),
+        target_id=1,
     )
 
-    row = q.get_repo(conn, "me/proj")
+    row = q.get_repo(conn, target_id=1, full_name="me/proj")
     assert row is not None
     assert row["last_commits_walked_sha"] == head
 
@@ -166,6 +170,7 @@ def test_user_mode_incremental_walk_skips_already_seen(conn, monkeypatch, tmp_gi
         username="me",
         emails=["me@example.com"],
         cfg=cfg,
+        target_id=1,
     )
     first_count = conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='commit'").fetchone()[0]
     assert first_count == 1
@@ -185,6 +190,7 @@ def test_user_mode_incremental_walk_skips_already_seen(conn, monkeypatch, tmp_gi
         username="me",
         emails=["me@example.com"],
         cfg=cfg,
+        target_id=1,
     )
     assert conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='commit'").fetchone()[0] == 2
 
@@ -208,7 +214,12 @@ def test_org_mode_resolves_author_login_via_cache(conn, monkeypatch, tmp_git_rep
     head = tmp_git_repo.head_sha
 
     q.upsert_repo(
-        conn, full_name="org/r", default_branch="main", pushed_at="2024-01-01T00:00:00Z", size_kb=10
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        size_kb=10,
     )
     _patch_commits_clone(monkeypatch, "org/r", tmp_git_repo.path, head)
     gh = FakeGH()  # no API responses needed
@@ -218,6 +229,7 @@ def test_org_mode_resolves_author_login_via_cache(conn, monkeypatch, tmp_git_rep
         gh=gh,
         cache=RawCache(tmp_git_repo.path / "raw"),
         cfg=IngestCfg(since="2020-01-01"),
+        target_id=1,
     )
 
     row = conn.execute(
@@ -244,7 +256,12 @@ def test_org_mode_noreply_email_resolves_without_api(conn, monkeypatch, tmp_git_
     head = tmp_git_repo.head_sha
 
     q.upsert_repo(
-        conn, full_name="org/r", default_branch="main", pushed_at="2024-01-01T00:00:00Z", size_kb=10
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        size_kb=10,
     )
     _patch_commits_clone(monkeypatch, "org/r", tmp_git_repo.path, head)
     gh = FakeGH()
@@ -254,6 +271,7 @@ def test_org_mode_noreply_email_resolves_without_api(conn, monkeypatch, tmp_git_
         gh=gh,
         cache=RawCache(tmp_git_repo.path / "raw"),
         cfg=IngestCfg(since="2020-01-01"),
+        target_id=1,
     )
     row = conn.execute(
         "SELECT author_login FROM artifact WHERE external_id=?",
@@ -273,7 +291,12 @@ def test_org_mode_persists_walked_sha(conn, monkeypatch, tmp_git_repo):
     )
     head = tmp_git_repo.head_sha
     q.upsert_repo(
-        conn, full_name="org/r", default_branch="main", pushed_at="2024-01-01T00:00:00Z", size_kb=10
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        size_kb=10,
     )
     _patch_commits_clone(monkeypatch, "org/r", tmp_git_repo.path, head)
     gh = FakeGH(login_search_results={"alice@example.com": "alice"})
@@ -283,8 +306,9 @@ def test_org_mode_persists_walked_sha(conn, monkeypatch, tmp_git_repo):
         gh=gh,
         cache=RawCache(tmp_git_repo.path / "raw"),
         cfg=IngestCfg(since="2020-01-01"),
+        target_id=1,
     )
-    repo_row = q.get_repo(conn, "org/r")
+    repo_row = q.get_repo(conn, target_id=1, full_name="org/r")
     assert repo_row["last_commits_walked_sha"] == head
 
 
@@ -297,7 +321,12 @@ def test_org_mode_is_idempotent(conn, monkeypatch, tmp_git_repo):
     )
     head = tmp_git_repo.head_sha
     q.upsert_repo(
-        conn, full_name="org/r", default_branch="main", pushed_at="2024-01-01T00:00:00Z", size_kb=10
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        size_kb=10,
     )
     q.upsert_email_login(conn, email="alice@example.com", login="alice", source="manual")
     _patch_commits_clone(monkeypatch, "org/r", tmp_git_repo.path, head)
@@ -309,6 +338,7 @@ def test_org_mode_is_idempotent(conn, monkeypatch, tmp_git_repo):
         gh=gh,
         cache=RawCache(tmp_git_repo.path / "raw"),
         cfg=cfg,
+        target_id=1,
     )
     n1 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     c1 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
@@ -318,6 +348,7 @@ def test_org_mode_is_idempotent(conn, monkeypatch, tmp_git_repo):
         gh=gh,
         cache=RawCache(tmp_git_repo.path / "raw"),
         cfg=cfg,
+        target_id=1,
     )
     n2 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     c2 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]

@@ -16,6 +16,7 @@ import pytest
 from github_twin.process.summarize import _clean_summary, summarize_chunks
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @dataclass
@@ -38,6 +39,7 @@ class FakeLLM:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "summarize.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -52,6 +54,7 @@ def _seed_code(
 ) -> int:
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id=f"a-{symbol}-{path}",
         source_url=None,
@@ -76,6 +79,7 @@ def _seed_code(
 def _seed_review(conn, *, text: str = "LGTM, ship it") -> int:
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="review_comment",
         external_id="r-1",
         source_url=None,
@@ -214,6 +218,7 @@ def test_code_prompt_includes_location_header(conn):
 def test_commit_message_prompt_uses_commit_system_prompt(conn):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id="c-1",
         source_url=None,

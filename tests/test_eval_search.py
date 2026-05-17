@@ -27,6 +27,7 @@ from github_twin.eval.search_evals import (
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.vector_store import SqliteVecStore
+from tests.conftest import seed_target
 
 
 class FakeEmbedder:
@@ -53,6 +54,7 @@ class FakeEmbedder:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "search_eval.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -60,6 +62,7 @@ def conn(tmp_path: Path):
 def _seed_code(conn, *, path, text, vec, symbol=None, node=None):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit",
         external_id=f"art-{path}-{symbol}",
         source_url=None,

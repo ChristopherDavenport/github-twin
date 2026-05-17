@@ -22,11 +22,13 @@ from github_twin.store.vector_store import (
     VectorSearchFilters,
     make_vector_store,
 )
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "vs.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -45,6 +47,7 @@ def _seed(
 ):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="commit" if kind == "code" else "review_comment",
         external_id=f"{kind}-{text}",
         source_url=None,

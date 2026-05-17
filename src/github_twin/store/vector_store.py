@@ -34,6 +34,7 @@ class VectorSearchFilters:
     repo: str | None = None
     author_login: str | None = None
     node_kind: str | None = None
+    target_id: int | None = None  # None = coalesce across every target; explicit narrows.
 
 
 @runtime_checkable
@@ -73,6 +74,7 @@ class SqliteVecStore:
             repo=filters.repo,
             author_login=filters.author_login,
             node_kind=filters.node_kind,
+            target_id=filters.target_id,
             k=k,
         )
 
@@ -176,7 +178,10 @@ def _candidate_chunk_ids(conn: sqlite3.Connection, f: VectorSearchFilters) -> se
     if f.node_kind is not None:
         where.append("c.node_kind = ?")
         params.append(f.node_kind)
-    needs_artifact = f.repo is not None or f.author_login is not None
+    needs_artifact = f.repo is not None or f.author_login is not None or f.target_id is not None
+    if f.target_id is not None:
+        where.append("a.target_id = ?")
+        params.append(f.target_id)
     if f.repo is not None:
         where.append("a.repo = ?")
         params.append(f.repo)
@@ -203,8 +208,11 @@ def _materialize_hits(
           c.id AS chunk_id, c.artifact_id, c.text, c.context_json,
           c.language AS chunk_language,
           a.kind AS artifact_kind, a.repo AS artifact_repo,
-          a.source_url AS artifact_source_url, a.decision AS artifact_decision
-        FROM chunk c JOIN artifact a ON a.id = c.artifact_id
+          a.source_url AS artifact_source_url, a.decision AS artifact_decision,
+          a.target_id AS target_id, t.name AS target_name, t.kind AS target_kind
+        FROM chunk c
+        JOIN artifact a ON a.id = c.artifact_id
+        JOIN target t ON t.id = a.target_id
         WHERE c.id IN ({placeholders})
         """,
         chunk_ids,
@@ -227,6 +235,9 @@ def _materialize_hits(
                 artifact_repo=r["artifact_repo"],
                 artifact_source_url=r["artifact_source_url"],
                 artifact_decision=r["artifact_decision"],
+                target_id=r["target_id"],
+                target_name=r["target_name"],
+                target_kind=r["target_kind"],
             )
         )
     return hits
@@ -273,6 +284,7 @@ def hybrid_search(
         repo=filters.repo,
         author_login=filters.author_login,
         node_kind=filters.node_kind,
+        target_id=filters.target_id,
         k=fetch,
         expander=expander,
     )

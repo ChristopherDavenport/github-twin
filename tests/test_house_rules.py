@@ -14,11 +14,13 @@ import pytest
 from github_twin.mcp_server.tools import house_rules
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "house.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -40,6 +42,7 @@ def _seed_rule(
     `distill_rules` would do but without the LLM."""
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="rule",
         external_id=external_id or f"r-{chunk_kind}-{text[:20]}",
         source_url=urls[0] if urls else None,
@@ -239,14 +242,13 @@ def test_author_login_filter_restricts_to_one_author(conn):
 def test_scope_personal_fills_author_login_from_user_target(conn):
     """`scope="personal"` in a user-mode target should restrict to that
     user's rules without the caller naming the login explicitly."""
-    # Stamp a user-mode target.
-    q.upsert_target(conn, kind="user", name="alice", external_id=1, emails=None)
+    # The conftest fixture seeded a user-mode target named 'me'.
     _seed_rule(
         conn,
-        text="alice-rule",
+        text="me-rule",
         chunk_kind="rule",
         language="scala",
-        author_login="alice",
+        author_login="me",
         external_id="ra",
     )
     _seed_rule(
@@ -260,19 +262,18 @@ def test_scope_personal_fills_author_login_from_user_target(conn):
     out = house_rules(conn, scope="personal")
     md = out["markdown"]
     assert out["review_rules"] == 1
-    assert "alice-rule" in md
+    assert "me-rule" in md
     assert "bob-rule" not in md
 
 
 def test_explicit_kwargs_win_over_scope(conn):
     """`scope="personal"` should not override an explicit author_login."""
-    q.upsert_target(conn, kind="user", name="alice", external_id=1, emails=None)
     _seed_rule(
         conn,
-        text="alice-rule",
+        text="me-rule",
         chunk_kind="rule",
         language="scala",
-        author_login="alice",
+        author_login="me",
         external_id="ra",
     )
     _seed_rule(
@@ -287,4 +288,4 @@ def test_explicit_kwargs_win_over_scope(conn):
     md = out["markdown"]
     assert out["review_rules"] == 1
     assert "bob-rule" in md
-    assert "alice-rule" not in md
+    assert "me-rule" not in md

@@ -13,6 +13,7 @@ from github_twin.mcp_server import tools as t
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.vector_store import SqliteVecStore
+from tests.conftest import seed_target
 
 
 class FakeEmbedder:
@@ -39,6 +40,7 @@ class FakeEmbedder:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "mcp_integration.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -46,6 +48,7 @@ def conn(tmp_path: Path):
 def _seed_review_comment(conn, *, text, vec, diff_hunk="def f(): pass"):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="review_comment",
         external_id=f"rc-{text}",
         source_url="https://gh/x/1#r1",

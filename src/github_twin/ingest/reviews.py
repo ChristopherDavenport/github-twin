@@ -74,10 +74,11 @@ def ingest_reviews(
     cache: RawCache,
     username: str,
     cfg: IngestCfg,
+    target_id: int,
     since: str | None = None,
     limit_prs: int | None = None,
 ) -> ReviewStats:
-    cursor = since or q.get_cursor(conn, "reviews") or cfg.since
+    cursor = since or q.get_cursor(conn, "reviews", target_id=target_id) or cfg.since
     log.info("ingesting reviews since %s", cursor)
     stats = ReviewStats()
     newest_updated: str | None = None
@@ -150,6 +151,7 @@ def ingest_reviews(
         # can aggregate over similar past PRs at query time.
         pr_artifact_id = q.upsert_artifact(
             conn,
+            target_id=target_id,
             kind="pr",
             external_id=f"{repo_full}#{pr_number}",
             source_url=item.get("html_url"),
@@ -196,6 +198,7 @@ def ingest_reviews(
 
             artifact_id = q.upsert_artifact(
                 conn,
+                target_id=target_id,
                 kind="review_comment",
                 external_id=self_id,
                 source_url=rc.get("html_url"),
@@ -239,6 +242,7 @@ def ingest_reviews(
                 continue
             artifact_id = q.upsert_artifact(
                 conn,
+                target_id=target_id,
                 kind="issue_comment",
                 external_id=self_id,
                 source_url=ic.get("html_url"),
@@ -267,7 +271,7 @@ def ingest_reviews(
             stats.issue_comments += 1
 
     if newest_updated and stats.prs_seen > 0:
-        q.set_cursor(conn, "reviews", _bump_iso(newest_updated))
+        q.set_cursor(conn, "reviews", _bump_iso(newest_updated), target_id=target_id)
     return stats
 
 
@@ -325,6 +329,7 @@ def _ingest_one_pr(
     conn: sqlite3.Connection,
     gh: GitHubClient,
     cache: RawCache,
+    target_id: int,
     repo_full: str,
     pr_item: dict[str, Any],
     stats: ReviewStats,
@@ -378,6 +383,7 @@ def _ingest_one_pr(
     reviewer_decisions = _per_reviewer_decisions(reviews_all)
     pr_artifact_id = q.upsert_artifact(
         conn,
+        target_id=target_id,
         kind="pr",
         external_id=f"{repo_full}#{pr_number}",
         source_url=pr_item.get("html_url"),
@@ -426,6 +432,7 @@ def _ingest_one_pr(
 
         artifact_id = q.upsert_artifact(
             conn,
+            target_id=target_id,
             kind="review_comment",
             external_id=self_id,
             source_url=rc.get("html_url"),
@@ -469,6 +476,7 @@ def _ingest_one_pr(
 
         artifact_id = q.upsert_artifact(
             conn,
+            target_id=target_id,
             kind="issue_comment",
             external_id=self_id,
             source_url=ic.get("html_url"),
@@ -505,12 +513,13 @@ def ingest_reviews_org(
     gh: GitHubClient,
     cache: RawCache,
     cfg: IngestCfg,
+    target_id: int,
     limit_prs_per_repo: int | None = None,
 ) -> ReviewStats:
     """Walk every repo's recently-updated PRs, capturing comments from all
     authors. Per-repo cursor is `last_reviews_at`; advance after each repo."""
     stats = ReviewStats()
-    repos = q.list_repos(conn)
+    repos = q.list_repos(conn, target_id=target_id)
     for row in repos:
         repo_full = row["full_name"]
         cursor = row.get("last_reviews_at")
@@ -523,9 +532,10 @@ def ingest_reviews_org(
                 conn=conn,
                 gh=gh,
                 cache=cache,
+                target_id=target_id,
                 repo_full=repo_full,
                 pr_item=pr_item,
                 stats=stats,
             )
-        q.set_repo_cursor(conn, full_name=repo_full, reviews_at=_now_iso())
+        q.set_repo_cursor(conn, target_id=target_id, full_name=repo_full, reviews_at=_now_iso())
     return stats

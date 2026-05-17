@@ -1,4 +1,16 @@
-"""All SQL access for github-twin. Keep SQL strings here, not scattered across modules."""
+"""All SQL access for github-twin. Keep SQL strings here, not scattered across modules.
+
+Multi-target shape:
+
+- Every per-target writer takes `target_id` and stamps it.
+- `sync_cursor` is keyed `(target_id, resource)`; pass `target_id=0` for
+  global resources like `embed_text_version`.
+- Search queries accept an optional `target_id` filter. When `None`
+  (coalesce mode), results are deduped on
+  `(artifact.kind, artifact.external_id, chunk_idx)` so the same commit
+  ingested under multiple targets contributes one hit. When explicit,
+  results are pre-narrowed to that target and no dedup is needed.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +21,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+# Sentinel target_id for cross-target sync cursors (e.g. embed_text_version).
+GLOBAL_TARGET_ID = 0
 
 # ---------- Helpers ----------
 
@@ -64,9 +79,12 @@ class SearchHit:
     artifact_repo: str | None
     artifact_source_url: str | None
     artifact_decision: str | None
+    target_id: int | None = None
+    target_name: str | None = None
+    target_kind: str | None = None
 
 
-# ---------- Target (singleton: who or what this DB tracks) ----------
+# ---------- Target ----------
 
 
 def upsert_target(
@@ -76,39 +94,85 @@ def upsert_target(
     name: str,
     external_id: int,
     emails: list[str] | None,
-) -> None:
+) -> int:
+    """Insert or refresh a target keyed by (kind, name). Returns its id."""
     emails_json = json.dumps(emails) if emails is not None else None
-    conn.execute(
-        "INSERT INTO target (id, kind, name, external_id, emails_json, discovered_at) "
-        "VALUES (1, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, "
+    cur = conn.execute(
+        "INSERT INTO target (kind, name, external_id, emails_json, discovered_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(kind, name) DO UPDATE SET "
         "external_id=excluded.external_id, emails_json=excluded.emails_json, "
-        "discovered_at=excluded.discovered_at",
+        "discovered_at=excluded.discovered_at "
+        "RETURNING id",
         (kind, name, external_id, emails_json, _now_iso()),
     )
+    row_id: int = cur.fetchone()["id"]
+    return row_id
 
 
-def get_target(conn: sqlite3.Connection) -> dict[str, Any] | None:
+def get_all_targets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT id, kind, name, external_id, emails_json, discovered_at FROM target ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_target_by_id(conn: sqlite3.Connection, target_id: int) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT kind, name, external_id, emails_json, discovered_at FROM target WHERE id=1"
+        "SELECT id, kind, name, external_id, emails_json, discovered_at FROM target WHERE id = ?",
+        (target_id,),
     ).fetchone()
-    if row is None:
-        return None
-    return {
-        "kind": row["kind"],
-        "name": row["name"],
-        "external_id": row["external_id"],
-        "emails": json.loads(row["emails_json"]) if row["emails_json"] else None,
-        "discovered_at": row["discovered_at"],
-    }
+    return dict(row) if row else None
 
 
-# ---------- Repos (org-mode: one row per repo we know about) ----------
+def get_targets_by_name(conn: sqlite3.Connection, name: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT id, kind, name, external_id, emails_json, discovered_at "
+        "FROM target WHERE name = ? ORDER BY id",
+        (name,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_targets_by_kind(conn: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT id, kind, name, external_id, emails_json, discovered_at "
+        "FROM target WHERE kind = ? ORDER BY id",
+        (kind,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
+    """Remove a target and cascade-delete its artifacts/repos/chunks/vectors.
+
+    Cleans up `sync_cursor` rows too (no FK there). Vectors get cleared via
+    the chunk ON DELETE CASCADE chain, but the `vec_chunk` virtual table
+    holds its own rows — wipe them explicitly first.
+    """
+    chunk_ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT c.id FROM chunk c "
+            "JOIN artifact a ON a.id = c.artifact_id "
+            "WHERE a.target_id = ?",
+            (target_id,),
+        ).fetchall()
+    ]
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(f"DELETE FROM vec_chunk WHERE chunk_id IN ({placeholders})", chunk_ids)
+    conn.execute("DELETE FROM sync_cursor WHERE target_id = ?", (target_id,))
+    conn.execute("DELETE FROM target WHERE id = ?", (target_id,))
+
+
+# ---------- Repos (org-mode / repo-mode: one row per (target, repo)) ----------
 
 
 def upsert_repo(
     conn: sqlite3.Connection,
     *,
+    target_id: int,
     full_name: str,
     default_branch: str | None,
     pushed_at: str | None,
@@ -119,27 +183,43 @@ def upsert_repo(
     """Insert or refresh repo metadata. Cursors (head_sha, last_*_at) are not
     touched here — those advance through `set_repo_cursor` after each phase."""
     conn.execute(
-        "INSERT INTO repo (full_name, default_branch, pushed_at, archived, fork, size_kb) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(full_name) DO UPDATE SET "
+        "INSERT INTO repo (target_id, full_name, default_branch, pushed_at, "
+        "archived, fork, size_kb) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(target_id, full_name) DO UPDATE SET "
         "default_branch=excluded.default_branch, pushed_at=excluded.pushed_at, "
         "archived=excluded.archived, fork=excluded.fork, size_kb=excluded.size_kb",
-        (full_name, default_branch, pushed_at, int(archived), int(fork), size_kb),
+        (target_id, full_name, default_branch, pushed_at, int(archived), int(fork), size_kb),
     )
 
 
-def get_repo(conn: sqlite3.Connection, full_name: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM repo WHERE full_name=?", (full_name,)).fetchone()
+def get_repo(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    full_name: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM repo WHERE target_id = ? AND full_name = ?",
+        (target_id, full_name),
+    ).fetchone()
     return dict(row) if row else None
 
 
 def list_repos(
     conn: sqlite3.Connection,
     *,
+    target_id: int | None = None,
     include_archived: bool = False,
     include_forks: bool = False,
 ) -> list[dict[str, Any]]:
+    """List repos. `target_id=None` returns rows from all targets (each
+    row carries `target_id`); explicit `target_id` narrows."""
     where: list[str] = []
+    params: list[Any] = []
+    if target_id is not None:
+        where.append("target_id = ?")
+        params.append(target_id)
     if not include_archived:
         where.append("archived = 0")
     if not include_forks:
@@ -148,12 +228,20 @@ def list_repos(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY full_name"
-    return [dict(r) for r in conn.execute(sql).fetchall()]
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def all_cached_repos(conn: sqlite3.Connection) -> set[str]:
+    """Union of `full_name` across every target. Used by `prune_cache` so
+    a clone is kept as long as *any* target still references it."""
+    rows = conn.execute("SELECT DISTINCT full_name FROM repo").fetchall()
+    return {r["full_name"] for r in rows}
 
 
 def set_repo_cursor(
     conn: sqlite3.Connection,
     *,
+    target_id: int,
     full_name: str,
     head_sha: str | None = None,
     files_at: str | None = None,
@@ -185,8 +273,11 @@ def set_repo_cursor(
         params.append(reviews_at)
     if not fields:
         return
-    params.append(full_name)
-    conn.execute(f"UPDATE repo SET {', '.join(fields)} WHERE full_name=?", params)
+    params.extend([target_id, full_name])
+    conn.execute(
+        f"UPDATE repo SET {', '.join(fields)} WHERE target_id=? AND full_name=?",
+        params,
+    )
 
 
 # ---------- Email → GitHub login cache ----------
@@ -222,17 +313,32 @@ def upsert_email_login(
 # ---------- Sync cursors ----------
 
 
-def get_cursor(conn: sqlite3.Connection, resource: str) -> str | None:
-    row = conn.execute("SELECT cursor FROM sync_cursor WHERE resource=?", (resource,)).fetchone()
+def get_cursor(
+    conn: sqlite3.Connection,
+    resource: str,
+    *,
+    target_id: int = GLOBAL_TARGET_ID,
+) -> str | None:
+    row = conn.execute(
+        "SELECT cursor FROM sync_cursor WHERE target_id = ? AND resource = ?",
+        (target_id, resource),
+    ).fetchone()
     return row["cursor"] if row else None
 
 
-def set_cursor(conn: sqlite3.Connection, resource: str, cursor: str) -> None:
+def set_cursor(
+    conn: sqlite3.Connection,
+    resource: str,
+    cursor: str,
+    *,
+    target_id: int = GLOBAL_TARGET_ID,
+) -> None:
     conn.execute(
-        "INSERT INTO sync_cursor (resource, cursor, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(resource) DO UPDATE SET cursor=excluded.cursor, "
+        "INSERT INTO sync_cursor (target_id, resource, cursor, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(target_id, resource) DO UPDATE SET cursor=excluded.cursor, "
         "updated_at=excluded.updated_at",
-        (resource, cursor, _now_iso()),
+        (target_id, resource, cursor, _now_iso()),
     )
 
 
@@ -242,6 +348,7 @@ def set_cursor(conn: sqlite3.Connection, resource: str, cursor: str) -> None:
 def upsert_artifact(
     conn: sqlite3.Connection,
     *,
+    target_id: int,
     kind: str,
     external_id: str,
     source_url: str | None,
@@ -253,18 +360,20 @@ def upsert_artifact(
     meta: dict[str, Any] | None,
     author_login: str | None = None,
 ) -> int:
-    """Insert or update an artifact keyed by (kind, external_id). Returns artifact id."""
+    """Insert or update an artifact keyed by (target_id, kind, external_id).
+    Returns artifact id."""
     cur = conn.execute(
-        "INSERT INTO artifact (kind, external_id, source_url, repo, language, "
+        "INSERT INTO artifact (target_id, kind, external_id, source_url, repo, language, "
         "author_email, author_login, created_at, decision, meta_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(kind, external_id) DO UPDATE SET "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(target_id, kind, external_id) DO UPDATE SET "
         "source_url=excluded.source_url, repo=excluded.repo, language=excluded.language, "
         "author_email=excluded.author_email, author_login=excluded.author_login, "
         "created_at=excluded.created_at, decision=excluded.decision, "
         "meta_json=excluded.meta_json "
         "RETURNING id",
         (
+            target_id,
             kind,
             external_id,
             source_url,
@@ -284,6 +393,7 @@ def upsert_artifact(
 def list_rules(
     conn: sqlite3.Connection,
     *,
+    target_id: int | None = None,
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
@@ -296,13 +406,16 @@ def list_rules(
     default) and code-pattern rules (`'code_rule'`). Both share
     `artifact.kind='rule'`.
 
-    `repo` filters on `artifact.repo` — the dominant repo stamped at
-    distill time. Cross-repo rules whose dominant repo doesn't match
-    won't surface even if `repo` appears in `meta.member_repos`; if
-    that becomes a problem we can promote the meta lookup later.
+    `target_id=None` coalesces across every target; explicit narrows.
+    Cross-target duplicates collapse via the `(kind, external_id)` index
+    on the underlying member-chunk-id hash, so two targets that distilled
+    the same rule key surface it once.
     """
     where = ["a.kind = 'rule'", "c.kind = ?"]
     params: list[Any] = [chunk_kind]
+    if target_id is not None:
+        where.append("a.target_id = ?")
+        params.append(target_id)
     if language is not None:
         where.append("a.language = ?")
         params.append(language)
@@ -312,13 +425,26 @@ def list_rules(
     if author_login is not None:
         where.append("a.author_login = ?")
         params.append(author_login)
+    if target_id is None:
+        # Coalesce dedup: one rule per (kind, external_id) across targets.
+        inner = (
+            "SELECT a.id, a.language, a.meta_json, c.text, "
+            "ROW_NUMBER() OVER (PARTITION BY a.kind, a.external_id "
+            "ORDER BY a.target_id, a.id) AS rn "
+            "FROM artifact a JOIN chunk c ON c.artifact_id = a.id "
+            f"WHERE {' AND '.join(where)}"
+        )
+        sql = (
+            f"SELECT id, language, meta_json, text FROM ({inner}) WHERE rn = 1 ORDER BY id LIMIT ?"
+        )
+    else:
+        sql = (
+            "SELECT a.id, a.language, a.meta_json, c.text "
+            "FROM artifact a JOIN chunk c ON c.artifact_id = a.id "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY a.id LIMIT ?"
+        )
     params.append(limit)
-    sql = (
-        "SELECT a.id, a.language, a.meta_json, c.text "
-        "FROM artifact a JOIN chunk c ON c.artifact_id = a.id "
-        f"WHERE {' AND '.join(where)} "
-        "ORDER BY a.id LIMIT ?"
-    )
     rows = conn.execute(sql, params).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
@@ -336,11 +462,23 @@ def list_rules(
     return out
 
 
-def artifact_exists(conn: sqlite3.Connection, kind: str, external_id: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM artifact WHERE kind=? AND external_id=? LIMIT 1",
-        (kind, external_id),
-    ).fetchone()
+def artifact_exists(
+    conn: sqlite3.Connection,
+    kind: str,
+    external_id: str,
+    *,
+    target_id: int | None = None,
+) -> bool:
+    if target_id is None:
+        row = conn.execute(
+            "SELECT 1 FROM artifact WHERE kind=? AND external_id=? LIMIT 1",
+            (kind, external_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM artifact WHERE target_id=? AND kind=? AND external_id=? LIMIT 1",
+            (target_id, kind, external_id),
+        ).fetchone()
     return row is not None
 
 
@@ -502,6 +640,70 @@ def write_embedding(
 # ---------- Search ----------
 
 
+def _select_columns() -> str:
+    """Shared SELECT-list for hit construction. Joins `target` so each hit
+    can carry the source target name back to the caller."""
+    return (
+        "c.id AS chunk_id, c.artifact_id, c.text, c.context_json, "
+        "c.language AS chunk_language, "
+        "a.kind AS artifact_kind, a.repo AS artifact_repo, "
+        "a.source_url AS artifact_source_url, a.decision AS artifact_decision, "
+        "a.kind AS dedup_kind, a.external_id AS dedup_external_id, "
+        "a.target_id AS target_id, t.name AS target_name, t.kind AS target_kind"
+    )
+
+
+def _hit_from_row(r: sqlite3.Row, distance: float) -> SearchHit:
+    return SearchHit(
+        chunk_id=r["chunk_id"],
+        artifact_id=r["artifact_id"],
+        distance=distance,
+        text=r["text"],
+        context=json.loads(r["context_json"]) if r["context_json"] else {},
+        artifact_kind=r["artifact_kind"],
+        artifact_language=r["chunk_language"],
+        artifact_repo=r["artifact_repo"],
+        artifact_source_url=r["artifact_source_url"],
+        artifact_decision=r["artifact_decision"],
+        target_id=r["target_id"],
+        target_name=r["target_name"],
+        target_kind=r["target_kind"],
+    )
+
+
+def _dedup_hits(hits: list[SearchHit], conn: sqlite3.Connection) -> list[SearchHit]:
+    """Coalesce-mode dedup: when the same commit / PR / file is ingested
+    under multiple targets, keep the first occurrence by ranked order.
+
+    The dedup key is `(artifact_kind, artifact_external_id, chunk_index)`.
+    `chunk_index` is fetched on-demand for the candidate set — multi-chunk
+    artifacts (e.g. a commit with N diff chunks) need it to distinguish
+    each chunk's identity across targets.
+    """
+    if not hits:
+        return hits
+    chunk_ids = list({h.chunk_id for h in hits})
+    placeholders = ",".join("?" * len(chunk_ids))
+    rows = conn.execute(
+        f"SELECT c.id AS chunk_id, c.artifact_id, a.kind AS akind, "
+        f"a.external_id AS ext_id, "
+        f"ROW_NUMBER() OVER (PARTITION BY c.artifact_id ORDER BY c.id) AS chunk_idx "
+        f"FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+        f"WHERE c.id IN ({placeholders})",
+        chunk_ids,
+    ).fetchall()
+    chunk_idx_by_id = {r["chunk_id"]: (r["akind"], r["ext_id"], r["chunk_idx"]) for r in rows}
+    seen: set[tuple[str, str | None, int]] = set()
+    out: list[SearchHit] = []
+    for h in hits:
+        key = chunk_idx_by_id.get(h.chunk_id)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+    return out
+
+
 def vector_search(
     conn: sqlite3.Connection,
     *,
@@ -511,10 +713,15 @@ def vector_search(
     repo: str | None = None,
     author_login: str | None = None,
     node_kind: str | None = None,
+    target_id: int | None = None,
     k: int = 5,
 ) -> list[SearchHit]:
     """KNN search restricted to chunks of a given kind (and optionally
-    language / repo / author_login / node_kind).
+    language / repo / author_login / node_kind / target_id).
+
+    `target_id=None` searches every target with on-the-fly dedup of
+    cross-target duplicates. An explicit `target_id` narrows the
+    candidate set (cheaper, no dedup needed).
 
     sqlite-vec supports `chunk_id IN (subquery)` as a pre-filter on the KNN,
     so we restrict the candidate set *before* the vector match. Crucial for
@@ -529,8 +736,10 @@ def vector_search(
     if node_kind is not None:
         where.append("c.node_kind = ?")
         cand_params.append(node_kind)
-    # repo and author_login both live on artifact, so join once if either supplied.
-    needs_artifact_join = repo is not None or author_login is not None
+    needs_artifact_join = repo is not None or author_login is not None or target_id is not None
+    if target_id is not None:
+        where.append("a.target_id = ?")
+        cand_params.append(target_id)
     if repo is not None:
         where.append("a.repo = ?")
         cand_params.append(repo)
@@ -541,6 +750,9 @@ def vector_search(
     join_artifact = " JOIN artifact a ON a.id = c.artifact_id" if needs_artifact_join else ""
     candidates_sql = f"SELECT c.id FROM chunk c{join_artifact} WHERE " + " AND ".join(where)
 
+    # Overscan when coalescing so dedup still has enough to return k.
+    fetch_k = k * 3 if target_id is None else k
+
     rows = conn.execute(
         f"""
         SELECT
@@ -548,19 +760,21 @@ def vector_search(
           c.artifact_id, c.text, c.context_json, c.language AS chunk_language,
           a.kind AS artifact_kind,
           a.repo AS artifact_repo, a.source_url AS artifact_source_url,
-          a.decision AS artifact_decision
+          a.decision AS artifact_decision,
+          a.target_id AS target_id, t.name AS target_name, t.kind AS target_kind
         FROM vec_chunk v
         JOIN chunk c ON c.id = v.chunk_id
         JOIN artifact a ON a.id = c.artifact_id
+        JOIN target t ON t.id = a.target_id
         WHERE v.chunk_id IN ({candidates_sql})
           AND v.embedding MATCH ?
           AND k = ?
         ORDER BY v.distance
         """,
-        (*cand_params, _pack_vec(query_vec), k),
+        (*cand_params, _pack_vec(query_vec), fetch_k),
     ).fetchall()
 
-    return [
+    hits = [
         SearchHit(
             chunk_id=r["chunk_id"],
             artifact_id=r["artifact_id"],
@@ -572,9 +786,15 @@ def vector_search(
             artifact_repo=r["artifact_repo"],
             artifact_source_url=r["artifact_source_url"],
             artifact_decision=r["artifact_decision"],
+            target_id=r["target_id"],
+            target_name=r["target_name"],
+            target_kind=r["target_kind"],
         )
         for r in rows
     ]
+    if target_id is None:
+        hits = _dedup_hits(hits, conn)[:k]
+    return hits
 
 
 def _fts_escape(text: str) -> str:
@@ -636,6 +856,7 @@ def bm25_search(
     repo: str | None = None,
     author_login: str | None = None,
     node_kind: str | None = None,
+    target_id: int | None = None,
     k: int = 5,
     expander: Any | None = None,
 ) -> list[SearchHit]:
@@ -658,7 +879,10 @@ def bm25_search(
     if node_kind is not None:
         where.append("c.node_kind = ?")
         cand_params.append(node_kind)
-    needs_artifact_join = repo is not None or author_login is not None
+    needs_artifact_join = repo is not None or author_login is not None or target_id is not None
+    if target_id is not None:
+        where.append("a.target_id = ?")
+        cand_params.append(target_id)
     if repo is not None:
         where.append("a.repo = ?")
         cand_params.append(repo)
@@ -674,6 +898,8 @@ def bm25_search(
     else:
         match_expr = _fts_escape(query_text)
 
+    fetch_k = k * 3 if target_id is None else k
+
     rows = conn.execute(
         f"""
         SELECT
@@ -681,19 +907,21 @@ def bm25_search(
           c.artifact_id, c.text, c.context_json, c.language AS chunk_language,
           a.kind AS artifact_kind,
           a.repo AS artifact_repo, a.source_url AS artifact_source_url,
-          a.decision AS artifact_decision
+          a.decision AS artifact_decision,
+          a.target_id AS target_id, t.name AS target_name, t.kind AS target_kind
         FROM chunk_fts f
         JOIN chunk c ON c.id = f.rowid
         JOIN artifact a ON a.id = c.artifact_id
+        JOIN target t ON t.id = a.target_id
         WHERE f.rowid IN ({candidates_sql})
           AND chunk_fts MATCH ?
         ORDER BY score
         LIMIT ?
         """,
-        (*cand_params, match_expr, k),
+        (*cand_params, match_expr, fetch_k),
     ).fetchall()
 
-    return [
+    hits = [
         SearchHit(
             chunk_id=r["chunk_id"],
             artifact_id=r["artifact_id"],
@@ -705,9 +933,15 @@ def bm25_search(
             artifact_repo=r["artifact_repo"],
             artifact_source_url=r["artifact_source_url"],
             artifact_decision=r["artifact_decision"],
+            target_id=r["target_id"],
+            target_name=r["target_name"],
+            target_kind=r["target_kind"],
         )
         for r in rows
     ]
+    if target_id is None:
+        hits = _dedup_hits(hits, conn)[:k]
+    return hits
 
 
 # ---------- Developer profile (cache + sampling) ----------
@@ -719,21 +953,25 @@ def recent_review_comments(
     author_login: str | None = None,
     repo: str | None = None,
     language: str | None = None,
+    target_id: int | None = None,
     limit: int = 50,
 ) -> list[ChunkRow]:
     """Return the N most-recent review-comment chunks, ordered by their
     parent artifact's `created_at` DESC.
 
+    `target_id=None` coalesces across all targets and dedupes on
+    `(artifact.kind, artifact.external_id)` so the same comment ingested
+    twice surfaces once.
+
     `author_login=None` means "no filter" — appropriate in user mode
     where the whole corpus is one person's reviews; in org mode the
     caller almost always wants a specific login.
-
-    `repo` filters on `artifact.repo`; `language` filters on
-    `chunk.language` (populated from the review's diff path), so it
-    picks out comments anchored to code in that language.
     """
     where = ["c.kind = 'review_comment'"]
     params: list[Any] = []
+    if target_id is not None:
+        where.append("a.target_id = ?")
+        params.append(target_id)
     if author_login is not None:
         where.append("a.author_login = ?")
         params.append(author_login)
@@ -744,14 +982,31 @@ def recent_review_comments(
         where.append("c.language = ?")
         params.append(language)
     params.append(limit)
-    sql = (
-        "SELECT c.id, c.artifact_id, c.kind, c.text, c.context_json, "
-        "c.summary, c.embed_model "
-        "FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
-        "WHERE " + " AND ".join(where) + " "
-        "ORDER BY COALESCE(a.created_at, '') DESC "
-        "LIMIT ?"
-    )
+    if target_id is None:
+        # Coalesce: one row per (kind, external_id) across targets.
+        inner = (
+            "SELECT c.id, c.artifact_id, c.kind, c.text, c.context_json, "
+            "c.summary, c.embed_model, a.created_at, "
+            "ROW_NUMBER() OVER (PARTITION BY a.kind, a.external_id "
+            "ORDER BY a.target_id, a.id) AS rn "
+            "FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+            f"WHERE {' AND '.join(where)}"
+        )
+        sql = (
+            f"SELECT id, artifact_id, kind, text, context_json, summary, "
+            f"embed_model FROM ({inner}) "
+            "WHERE rn = 1 "
+            "ORDER BY COALESCE(created_at, '') DESC LIMIT ?"
+        )
+    else:
+        sql = (
+            "SELECT c.id, c.artifact_id, c.kind, c.text, c.context_json, "
+            "c.summary, c.embed_model "
+            "FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY COALESCE(a.created_at, '') DESC "
+            "LIMIT ?"
+        )
     rows = conn.execute(sql, params).fetchall()
     return [
         ChunkRow(
@@ -770,8 +1025,9 @@ def recent_review_comments(
 def get_cached_profile(conn: sqlite3.Connection, login: str) -> dict[str, Any] | None:
     """Fetch the cached developer profile for `login`, or None if absent.
 
-    Caller compares the returned `sample_hash` against the current set
-    of recent comments and decides whether to re-synthesize.
+    `login` is a composite string built by `_profile_cache_key` (it folds
+    in author / language / repo / target). The hash comparison decides
+    whether to re-synthesize.
     """
     row = conn.execute(
         "SELECT login, profile_md, sample_hash, n_samples, generated_at "
@@ -797,7 +1053,7 @@ def set_cached_profile(
     sample_hash: str,
     n_samples: int,
 ) -> None:
-    """Upsert the cached developer profile for `login`."""
+    """Upsert the cached developer profile for the composite cache key."""
     conn.execute(
         "INSERT INTO developer_profile_cache "
         "(login, profile_md, sample_hash, n_samples, generated_at) "
@@ -814,27 +1070,68 @@ def set_cached_profile(
 # ---------- Stats ----------
 
 
-def stats(conn: sqlite3.Connection) -> dict[str, Any]:
+def stats(conn: sqlite3.Connection, *, target_id: int | None = None) -> dict[str, Any]:
+    """Aggregate counts. `target_id=None` reports the whole DB."""
+    base_where = ""
+    params: tuple[Any, ...] = ()
+    if target_id is not None:
+        base_where = " WHERE target_id = ?"
+        params = (target_id,)
     artifact_counts = {
         r["kind"]: r["n"]
-        for r in conn.execute("SELECT kind, COUNT(*) AS n FROM artifact GROUP BY kind").fetchall()
-    }
-    chunk_counts = {
-        r["kind"]: r["n"]
-        for r in conn.execute("SELECT kind, COUNT(*) AS n FROM chunk GROUP BY kind").fetchall()
-    }
-    # Per-chunk language is what retrieval filters on; report that here.
-    lang_counts = {
-        r["language"]: r["n"]
         for r in conn.execute(
-            "SELECT language, COUNT(*) AS n FROM chunk "
-            "WHERE language IS NOT NULL GROUP BY language ORDER BY n DESC"
+            f"SELECT kind, COUNT(*) AS n FROM artifact{base_where} GROUP BY kind",
+            params,
         ).fetchall()
     }
-    pending_embed = conn.execute(
-        "SELECT COUNT(*) AS n FROM chunk WHERE embed_model IS NULL"
-    ).fetchone()["n"]
-    vec_rows = conn.execute("SELECT COUNT(*) AS n FROM vec_chunk").fetchone()["n"]
+    if target_id is None:
+        chunk_counts = {
+            r["kind"]: r["n"]
+            for r in conn.execute("SELECT kind, COUNT(*) AS n FROM chunk GROUP BY kind").fetchall()
+        }
+        lang_counts = {
+            r["language"]: r["n"]
+            for r in conn.execute(
+                "SELECT language, COUNT(*) AS n FROM chunk "
+                "WHERE language IS NOT NULL GROUP BY language ORDER BY n DESC"
+            ).fetchall()
+        }
+        pending_embed = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunk WHERE embed_model IS NULL"
+        ).fetchone()["n"]
+        vec_rows = conn.execute("SELECT COUNT(*) AS n FROM vec_chunk").fetchone()["n"]
+    else:
+        chunk_counts = {
+            r["kind"]: r["n"]
+            for r in conn.execute(
+                "SELECT c.kind AS kind, COUNT(*) AS n FROM chunk c "
+                "JOIN artifact a ON a.id = c.artifact_id "
+                "WHERE a.target_id = ? GROUP BY c.kind",
+                params,
+            ).fetchall()
+        }
+        lang_counts = {
+            r["language"]: r["n"]
+            for r in conn.execute(
+                "SELECT c.language AS language, COUNT(*) AS n FROM chunk c "
+                "JOIN artifact a ON a.id = c.artifact_id "
+                "WHERE a.target_id = ? AND c.language IS NOT NULL "
+                "GROUP BY c.language ORDER BY n DESC",
+                params,
+            ).fetchall()
+        }
+        pending_embed = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+            "WHERE a.target_id = ? AND c.embed_model IS NULL",
+            params,
+        ).fetchone()["n"]
+        vec_rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM vec_chunk v "
+            "JOIN chunk c ON c.id = v.chunk_id "
+            "JOIN artifact a ON a.id = c.artifact_id "
+            "WHERE a.target_id = ?",
+            params,
+        ).fetchone()["n"]
     return {
         "artifacts": artifact_counts,
         "chunks": chunk_counts,

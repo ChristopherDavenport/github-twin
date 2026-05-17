@@ -3,6 +3,10 @@
 Both `gt ingest`/`gt embed` and the MCP `sync` tool call into these.
 Output goes through a `Reporter` so callers control where progress lines land
 (stdout vs. server logs vs. silent).
+
+Multi-target: `run_ingest` iterates every target in the DB (or a single
+specified target) and dispatches per-target. `run_embed` and `run_summarize`
+are corpus-wide — they work over any chunk regardless of target.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from github_twin.ingest.reviews import ingest_reviews, ingest_reviews_org
 from github_twin.process.summarize import summarize_chunks
 from github_twin.store import queries as q
 from github_twin.store.db import transaction
-from github_twin.target import load_target
+from github_twin.target import Target, load_targets
 
 
 class IdentityMissingError(RuntimeError):
@@ -49,6 +53,22 @@ def _noop(_: str) -> None:
     return None
 
 
+def _resolve_targets(conn: sqlite3.Connection, target_filter: int | str | None) -> list[Target]:
+    """Return the targets `run_ingest` should walk. `None` = all of them."""
+    if target_filter is None:
+        return load_targets(conn)
+    targets = load_targets(conn)
+    if isinstance(target_filter, int):
+        out = [t for t in targets if t.id == target_filter]
+    else:
+        out = [t for t in targets if t.name == target_filter]
+    if not out:
+        raise IdentityMissingError(
+            f"No target matches {target_filter!r}. Existing: {[(t.kind, t.name) for t in targets]}"
+        )
+    return out
+
+
 def run_ingest(
     cfg: Config,
     conn: sqlite3.Connection,
@@ -57,22 +77,51 @@ def run_ingest(
     commits_only: bool = False,
     reviews_only: bool = False,
     limit: int | None = None,
+    target: int | str | None = None,
     report: Reporter = _noop,
 ) -> dict[str, object]:
-    target = load_target(conn)
-    if target is None:
-        raise IdentityMissingError("No target. Run `gt init` first.")
+    targets = _resolve_targets(conn, target)
+    if not targets:
+        raise IdentityMissingError("No targets. Run `gt init` first.")
+    aggregate: dict[str, object] = {}
+    for t in targets:
+        assert t.id is not None
+        if len(targets) > 1:
+            report(f"=== target: {t.kind} {t.name} (id {t.id}) ===")
+        summary = _ingest_one(
+            cfg=cfg,
+            conn=conn,
+            target=t,
+            since=since,
+            commits_only=commits_only,
+            reviews_only=reviews_only,
+            limit=limit,
+            report=report,
+        )
+        aggregate[f"{t.kind}:{t.name}"] = summary
+    return aggregate
 
+
+def _ingest_one(
+    *,
+    cfg: Config,
+    conn: sqlite3.Connection,
+    target: Target,
+    since: str | None,
+    commits_only: bool,
+    reviews_only: bool,
+    limit: int | None,
+    report: Reporter,
+) -> dict[str, object]:
+    assert target.id is not None
     if target.is_org or target.is_repo:
         # Repo mode shares the org-mode pipeline because the repo table just
         # has one row instead of many; the per-repo iteration inside
         # ingest_files/commits_org/reviews_org handles either width.
         summary: dict[str, object] = {}
         cache = RawCache(cfg.paths.raw_dir)
-        # File-at-HEAD walk runs first (O-C). When the caller explicitly asked
-        # for commits-only or reviews-only, skip the file phase.
         if not (commits_only or reviews_only):
-            s_files = ingest_files(conn=conn, cfg=cfg.ingest, limit=limit)
+            s_files = ingest_files(conn=conn, cfg=cfg.ingest, target_id=target.id, limit=limit)
             summary["files"] = s_files
             report(f"files: {s_files}")
         with GitHubClient() as gh:
@@ -83,6 +132,7 @@ def run_ingest(
                         gh=gh,
                         cache=cache,
                         cfg=cfg.ingest,
+                        target_id=target.id,
                         limit_per_repo=limit,
                     )
                 summary["commits"] = s_commits
@@ -94,6 +144,7 @@ def run_ingest(
                         gh=gh,
                         cache=cache,
                         cfg=cfg.ingest,
+                        target_id=target.id,
                         limit_prs_per_repo=limit,
                     )
                 summary["reviews"] = s_reviews
@@ -112,6 +163,7 @@ def run_ingest(
                     username=target.name,
                     emails=target.emails,
                     cfg=cfg.ingest,
+                    target_id=target.id,
                     since=since,
                     limit=limit,
                 )
@@ -125,6 +177,7 @@ def run_ingest(
                     cache=cache,
                     username=target.name,
                     cfg=cfg.ingest,
+                    target_id=target.id,
                     since=since,
                     limit_prs=limit,
                 )

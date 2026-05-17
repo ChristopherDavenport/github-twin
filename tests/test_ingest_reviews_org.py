@@ -18,11 +18,13 @@ from github_twin.ingest.cache import RawCache
 from github_twin.ingest.reviews import ingest_reviews_org
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -89,6 +91,7 @@ def _ic(id_: int, login: str, body: str) -> dict:
 def test_org_reviews_keeps_all_authors(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -109,7 +112,9 @@ def test_org_reviews_keeps_all_authors(conn, tmp_path: Path):
             },
         },
     )
-    stats = ingest_reviews_org(conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg())
+    stats = ingest_reviews_org(
+        conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg(), target_id=1
+    )
     assert stats.prs_seen == 1
     assert stats.review_comments == 2
     assert stats.issue_comments == 1
@@ -129,12 +134,13 @@ def test_org_reviews_keeps_all_authors(conn, tmp_path: Path):
 def test_org_reviews_stops_at_cursor(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
         size_kb=10,
     )
-    q.set_repo_cursor(conn, full_name="org/r", reviews_at="2024-02-15T00:00:00Z")
+    q.set_repo_cursor(conn, target_id=1, full_name="org/r", reviews_at="2024-02-15T00:00:00Z")
 
     gh = FakeGH(
         repos={
@@ -152,7 +158,9 @@ def test_org_reviews_stops_at_cursor(conn, tmp_path: Path):
             },
         },
     )
-    stats = ingest_reviews_org(conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg())
+    stats = ingest_reviews_org(
+        conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg(), target_id=1
+    )
     assert stats.prs_seen == 1
     # Only the new PR's comments landed; the older PR's comment was filtered.
     ids = {
@@ -167,6 +175,7 @@ def test_org_reviews_stops_at_cursor(conn, tmp_path: Path):
 def test_org_reviews_advances_cursor(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -175,5 +184,7 @@ def test_org_reviews_advances_cursor(conn, tmp_path: Path):
     gh = FakeGH(
         repos={"org/r": {"prs": [], "review_comments": {}, "reviews": {}, "issue_comments": {}}}
     )
-    ingest_reviews_org(conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg())
-    assert q.get_repo(conn, "org/r")["last_reviews_at"] is not None
+    ingest_reviews_org(
+        conn=conn, gh=gh, cache=RawCache(tmp_path / "raw"), cfg=IngestCfg(), target_id=1
+    )
+    assert q.get_repo(conn, target_id=1, full_name="org/r")["last_reviews_at"] is not None

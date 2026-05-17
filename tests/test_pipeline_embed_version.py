@@ -16,6 +16,7 @@ from github_twin.config import Config, EmbedCfg, VectorStoreCfg
 from github_twin.pipeline import _EMBED_VERSION_KEY, EMBED_TEXT_VERSION, run_embed
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 class FakeEmbedder:
@@ -43,6 +44,7 @@ def cfg(tmp_path: Path):
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "embed_version.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -52,6 +54,7 @@ def _seed_chunks(conn, n: int = 3) -> list[int]:
     for i in range(n):
         aid = q.upsert_artifact(
             conn,
+            target_id=1,
             kind="commit",
             external_id=f"c-{i}",
             source_url=None,

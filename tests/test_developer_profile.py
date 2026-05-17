@@ -17,6 +17,7 @@ from github_twin.distill.profile import sample_hash, synthesize_profile
 from github_twin.mcp_server.tools import _DEFAULT_PROFILE_LOGIN, developer_profile
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @dataclass
@@ -33,6 +34,7 @@ class FakeLLM:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "profile.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -48,6 +50,7 @@ def _seed_review(
 ) -> int:
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="review_comment",
         external_id=f"r-{author}-{repo}-{language or 'NL'}-{text[:20]}",
         source_url=None,

@@ -31,6 +31,7 @@ from github_twin.eval.runner import (
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
 from github_twin.store.vector_store import SqliteVecStore
+from tests.conftest import seed_target
 
 # ---------- fixtures ----------
 
@@ -72,6 +73,7 @@ class StubLLM:
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "eval.sqlite", embed_dim=FakeEmbedder.dim)
+    seed_target(db)
     yield db
     db.close()
 
@@ -89,6 +91,7 @@ def _seed_rc(
 ):
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="review_comment",
         external_id=ext_id,
         source_url=f"https://gh/{ext_id}",
@@ -134,6 +137,7 @@ def _seed_pr(
         meta["reviewer_decisions"] = reviewer_decisions
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="pr",
         external_id=ext_id,
         source_url=f"https://gh/x/{ext_id}",
@@ -234,6 +238,7 @@ def test_iter_held_out_review_comments_skips_missing_hunk(conn):
     """Comments without a diff_hunk can't be evaluated — skip silently."""
     aid = q.upsert_artifact(
         conn,
+        target_id=1,
         kind="review_comment",
         external_id="x",
         source_url=None,

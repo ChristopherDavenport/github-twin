@@ -1,17 +1,49 @@
 """Shared pytest fixtures for github-twin.
 
 `tmp_git_repo` builds a tiny real git repo on disk with controlled author
-metadata and a few commits. Used by the git-local commits ingest tests so we
-exercise the actual `git log` / `git show` parsing without hitting GitHub.
+metadata and a few commits.
+
+`seed_target` writes a target row directly so tests don't need to spin
+up the discovery layer. Most tests pin to a single user-mode target with
+id=1; multi-target tests can seed additional rows.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+
+def seed_target(
+    conn: sqlite3.Connection,
+    *,
+    kind: str = "user",
+    name: str = "me",
+    external_id: int = 1,
+    emails: list[str] | None = None,
+) -> int:
+    """Insert a target row and return its id. Idempotent on (kind, name).
+
+    Tests that need a writable artifact/repo/sync_cursor call this once
+    in setup. Default seeds a user-mode target so legacy single-target
+    tests keep working with a `target_id=1` everywhere.
+    """
+    emails_json = json.dumps(emails) if (emails is not None and kind == "user") else None
+    cur = conn.execute(
+        "INSERT INTO target (kind, name, external_id, emails_json, discovered_at) "
+        "VALUES (?, ?, ?, ?, '2024-01-01T00:00:00+00:00') "
+        "ON CONFLICT(kind, name) DO UPDATE SET "
+        "external_id=excluded.external_id, emails_json=excluded.emails_json "
+        "RETURNING id",
+        (kind, name, external_id, emails_json),
+    )
+    row_id: int = cur.fetchone()[0]
+    return row_id
 
 
 def _git(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:

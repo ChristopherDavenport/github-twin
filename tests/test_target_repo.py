@@ -174,9 +174,11 @@ def conn_with_repo_target(tmp_path: Path):
     db = open_db(tmp_path / "repo.sqlite", embed_dim=4)
     target = Target(kind="repo", name="me/x", external_id=1, emails=[])
     with transaction(db):
-        save_target(db, target)
+        target = save_target(db, target)
+        assert target.id is not None
         q.upsert_repo(
             db,
+            target_id=target.id,
             full_name="me/x",
             default_branch="main",
             pushed_at="2024-01-01T00:00:00Z",
@@ -189,15 +191,15 @@ def test_run_ingest_dispatches_repo_kind_through_org_path(conn_with_repo_target,
     """Repo mode must reuse the same three ingest functions org mode uses."""
     called: dict[str, int] = {"files": 0, "commits": 0, "reviews": 0}
 
-    def fake_files(*, conn, cfg, limit=None):
+    def fake_files(*, conn, cfg, target_id, limit=None):
         called["files"] += 1
         return {"repos_walked": 0}
 
-    def fake_commits(*, conn, gh, cache, cfg, limit_per_repo=None):
+    def fake_commits(*, conn, gh, cache, cfg, target_id, limit_per_repo=None):
         called["commits"] += 1
         return {"new_commits": 0}
 
-    def fake_reviews(*, conn, gh, cache, cfg, limit_prs_per_repo=None):
+    def fake_reviews(*, conn, gh, cache, cfg, target_id, limit_prs_per_repo=None):
         called["reviews"] += 1
         return {"new_review_comments": 0}
 

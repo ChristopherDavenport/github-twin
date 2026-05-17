@@ -22,11 +22,13 @@ from github_twin.ingest.cache import RawCache
 from github_twin.ingest.commits import ingest_commits_org
 from github_twin.store import queries as q
 from github_twin.store.db import open_db
+from tests.conftest import seed_target
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     db = open_db(tmp_path / "test.sqlite", embed_dim=4)
+    seed_target(db)
     yield db
     db.close()
 
@@ -84,6 +86,7 @@ def _commit(sha: str, login: str, email: str, date: str) -> dict:
 def test_ingest_commits_org_captures_author_login(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -104,6 +107,7 @@ def test_ingest_commits_org_captures_author_login(conn, tmp_path: Path):
         gh=gh,
         cache=cache,
         cfg=IngestCfg(use_local_git_for_commits=False),
+        target_id=1,
     )
 
     assert stats.fetched == 2
@@ -118,6 +122,7 @@ def test_ingest_commits_org_captures_author_login(conn, tmp_path: Path):
 def test_ingest_commits_org_advances_per_repo_cursor(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/a",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -125,6 +130,7 @@ def test_ingest_commits_org_advances_per_repo_cursor(conn, tmp_path: Path):
     )
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/b",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -143,10 +149,11 @@ def test_ingest_commits_org_advances_per_repo_cursor(conn, tmp_path: Path):
         gh=gh,
         cache=cache,
         cfg=IngestCfg(use_local_git_for_commits=False),
+        target_id=1,
     )
 
-    a = q.get_repo(conn, "org/a")
-    b = q.get_repo(conn, "org/b")
+    a = q.get_repo(conn, target_id=1, full_name="org/a")
+    b = q.get_repo(conn, target_id=1, full_name="org/b")
     # Both repos advance their cursor — even the empty one, since we
     # successfully observed "nothing new" through that point in time.
     assert a["last_commits_at"] is not None
@@ -156,6 +163,7 @@ def test_ingest_commits_org_advances_per_repo_cursor(conn, tmp_path: Path):
 def test_ingest_commits_org_is_idempotent(conn, tmp_path: Path):
     q.upsert_repo(
         conn,
+        target_id=1,
         full_name="org/r",
         default_branch="main",
         pushed_at="2024-01-01T00:00:00Z",
@@ -173,6 +181,7 @@ def test_ingest_commits_org_is_idempotent(conn, tmp_path: Path):
         gh=gh,
         cache=cache,
         cfg=IngestCfg(use_local_git_for_commits=False),
+        target_id=1,
     )
     n1 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     c1 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
@@ -181,6 +190,7 @@ def test_ingest_commits_org_is_idempotent(conn, tmp_path: Path):
         gh=gh,
         cache=cache,
         cfg=IngestCfg(use_local_git_for_commits=False),
+        target_id=1,
     )
     n2 = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
     c2 = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]

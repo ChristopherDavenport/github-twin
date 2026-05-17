@@ -1,4 +1,4 @@
-"""Target: who or what this DB tracks.
+"""Target: who or what a target row tracks.
 
 Three kinds:
   - user: a single GitHub user. Carries the discovered email set used to widen
@@ -7,10 +7,12 @@ Three kinds:
           the `repo` table populated by `gt init`.
   - repo: a single repository. Same pipeline as org with one repo-table row,
           but the target name is `'owner/name'`. Designed for the
-          "cd into a cloned repo; just work" workflow that a Claude Code
-          plugin will eventually drive without manual `gt init`.
+          "cd into a cloned repo; just work" workflow.
 
-Discovery is per-kind. Persistence is a single table row, keyed at id=1.
+A single DB can hold many targets — one user-mode + N org-mode + M repo-mode
+co-exist. Per-target rows in `artifact` / `repo` / `sync_cursor` carry the
+parent `target.id`. `(kind, name)` is unique so `gt init` is idempotent
+per target.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class Target:
     name: str  # username, org login, or 'owner/name'
     external_id: int  # numeric GitHub id (user/org/repo id depending on kind)
     emails: list[str]  # user-mode only; empty list for org/repo
+    id: int | None = None  # set after upsert / load; None on freshly discovered
 
     @property
     def is_user(self) -> bool:
@@ -47,6 +50,10 @@ class Target:
     @property
     def is_repo(self) -> bool:
         return self.kind == "repo"
+
+
+class AmbiguousTargetError(RuntimeError):
+    """Raised when callers need a unique target but multiple match."""
 
 
 def discover_user(gh: GitHubClient, cfg: IdentityCfg, *, sweep_pages: int = 5) -> Target:
@@ -157,12 +164,8 @@ def discover_repo(
     - Else walk up from `start_path or Path.cwd()` to find `.git/config`,
       parse its `origin` URL, and use the resulting `'owner/name'`.
 
-    Raises ValueError with a hint on:
-      - no `.git` found and no `repo` given
-      - origin URL doesn't resolve to a github.com `owner/name`
-
     Returns `(Target, repo_metadata_dict)` where the second value is shaped
-    for `q.upsert_repo(**metadata)`.
+    for `q.upsert_repo(**metadata)` (without target_id; the caller stamps it).
     """
     if repo is None:
         root = _find_git_root(start_path or Path.cwd())
@@ -212,26 +215,93 @@ def discover_repo(
 # ---------- persistence ----------
 
 
-def load_target(conn: sqlite3.Connection) -> Target | None:
-    data = q.get_target(conn)
-    if data is None:
-        return None
+def _row_to_target(row: dict[str, Any]) -> Target:
+    import json
+
+    emails_raw = row["emails_json"]
+    emails = json.loads(emails_raw) if emails_raw else []
     return Target(
-        kind=data["kind"],
-        name=data["name"],
-        external_id=data["external_id"],
-        emails=list(data["emails"] or []),
+        id=row["id"],
+        kind=row["kind"],
+        name=row["name"],
+        external_id=row["external_id"],
+        emails=list(emails),
     )
 
 
-def save_target(conn: sqlite3.Connection, target: Target) -> None:
-    q.upsert_target(
+def load_targets(conn: sqlite3.Connection) -> list[Target]:
+    """Return every target in the DB, ordered by id."""
+    return [_row_to_target(row) for row in q.get_all_targets(conn)]
+
+
+def load_target(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int | None = None,
+    name: str | None = None,
+    kind: str | None = None,
+) -> Target | None:
+    """Look up a single target.
+
+    Exactly one of `target_id`, `name`, or `kind` should narrow the
+    search:
+      - `target_id=N` → exact id match.
+      - `name="X"` → exact name match (raises `AmbiguousTargetError` if
+        two kinds share the name, which shouldn't happen in practice).
+      - `kind="user"` → return the sole target of that kind, or None
+        if absent; raises `AmbiguousTargetError` if >1 exist.
+
+    With no arguments, returns the lone target if exactly one exists,
+    None if zero, raises `AmbiguousTargetError` if >1. This is the
+    backward-compatible single-target convenience.
+    """
+    if target_id is not None:
+        row = q.get_target_by_id(conn, target_id)
+        return _row_to_target(row) if row else None
+    if name is not None:
+        rows = q.get_targets_by_name(conn, name)
+        if not rows:
+            return None
+        if len(rows) > 1:
+            kinds = sorted({r["kind"] for r in rows})
+            raise AmbiguousTargetError(
+                f"Multiple targets named {name!r} (kinds: {kinds}); pass kind="
+            )
+        return _row_to_target(rows[0])
+    if kind is not None:
+        rows = q.get_targets_by_kind(conn, kind)
+        if not rows:
+            return None
+        if len(rows) > 1:
+            names = sorted(r["name"] for r in rows)
+            raise AmbiguousTargetError(
+                f"Multiple {kind!r} targets: {names}; pass name= or target_id="
+            )
+        return _row_to_target(rows[0])
+    rows = q.get_all_targets(conn)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        names = sorted(f"{r['kind']}:{r['name']}" for r in rows)
+        raise AmbiguousTargetError(
+            f"Multiple targets in DB ({names}); pass target_id=, name=, or kind="
+        )
+    return _row_to_target(rows[0])
+
+
+def save_target(conn: sqlite3.Connection, target: Target) -> Target:
+    """Insert-or-update a target row keyed by (kind, name). Returns a
+    Target with `id` populated. Idempotent: re-running with the same
+    (kind, name) updates the existing row in place."""
+    target_id = q.upsert_target(
         conn,
         kind=target.kind,
         name=target.name,
         external_id=target.external_id,
         emails=target.emails if target.is_user else None,
     )
+    target.id = target_id
+    return target
 
 
 def maybe_discover_repo(
