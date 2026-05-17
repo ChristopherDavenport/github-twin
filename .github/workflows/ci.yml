@@ -39,17 +39,7 @@ jobs:
         # see [tool.mypy] in pyproject.toml.
         run: uv run mypy
       - name: Tests
-        run: uv run pytest -q --cov=github_twin --cov-report=xml --cov-report=term
-      - name: Upload coverage to Codecov
-        # Only one matrix leg uploads — the report doesn't change across
-        # python versions for our suite. `fail_ci_if_error: false` keeps a
-        # transient Codecov outage from blocking a green test pass.
-        if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+        run: uv run pytest -q
       - name: Build (smoke)
         run: uv build
         # Confirms the wheel still packages cleanly with hatch-vcs;

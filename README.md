@@ -3,7 +3,6 @@
 [![PyPI version](https://img.shields.io/pypi/v/github-twin.svg)](https://pypi.org/project/github-twin/)
 [![Python versions](https://img.shields.io/pypi/pyversions/github-twin.svg)](https://pypi.org/project/github-twin/)
 [![CI](https://github.com/ChristopherDavenport/github-twin/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristopherDavenport/github-twin/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/ChristopherDavenport/github-twin/branch/main/graph/badge.svg)](https://codecov.io/gh/ChristopherDavenport/github-twin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > You reviewed a permission check six months ago. Claude doesn't remember
