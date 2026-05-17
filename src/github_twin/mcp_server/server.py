@@ -75,6 +75,15 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
     embedder = make_embedder(cfg.embed)
     store = make_vector_store(conn, backend=cfg.vector_store.backend, dim=cfg.embed.dim)
     expander = expander_from_config(cfg)
+    # Captured once at startup so each tool call falls back to the same
+    # default unless the caller passes an explicit `recency_half_life_days`.
+    cfg_recency = cfg.retrieval.recency_half_life_days
+
+    def _resolve_recency(override: float | None) -> float | None:
+        """None from the caller falls through to the cfg default; any
+        explicit value (including 0, which disables decay) wins."""
+        return override if override is not None else cfg_recency
+
     # LLM used by `developer_profile`. Lazy: only constructed if the tool
     # is called (FastMCP's `@mcp.tool` registration doesn't invoke the
     # function until a client calls it), so a server that never sees a
@@ -102,6 +111,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         target: str | None = None,
         scope: Scope = "all",
         k: int = 5,
+        recency_half_life_days: float | None = None,
     ) -> list[dict[str, Any]]:
         """Find past review comments on diffs similar to `diff_hunk`.
 
@@ -116,6 +126,10 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 'project' to the unique repo-mode target; 'all' (default)
                 is unscoped. Explicit kwargs win.
             k: Max results to return.
+            recency_half_life_days: Override the server's recency decay
+                half-life for this call. Unset = use the configured
+                `retrieval.recency_half_life_days` default (often None,
+                meaning no decay).
         """
         with tracer().start_as_current_span("mcp.tool.find_review_comments") as span:
             set_safe_attributes(
@@ -142,6 +156,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 scope=scope,
                 k=k,
                 expander=expander,
+                recency_half_life_days=_resolve_recency(recency_half_life_days),
             )
             _record_result_count(span, result)
             return result
@@ -155,6 +170,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         target: str | None = None,
         scope: Scope = "all",
         k: int = 5,
+        recency_half_life_days: float | None = None,
     ) -> list[dict[str, Any]]:
         """Find code that matches a description, for style reference.
 
@@ -166,6 +182,8 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             target: Optional target name. Unset = coalesce across every target.
             scope: 'personal' / 'project' / 'all' — see find_review_comments.
             k: Max results to return.
+            recency_half_life_days: Override the server's recency decay
+                half-life for this call. Unset = use the configured default.
         """
         with tracer().start_as_current_span("mcp.tool.find_style_examples") as span:
             set_safe_attributes(
@@ -192,6 +210,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 scope=scope,
                 k=k,
                 expander=expander,
+                recency_half_life_days=_resolve_recency(recency_half_life_days),
             )
             _record_result_count(span, result)
             return result
@@ -205,6 +224,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         node_kind: str | None = None,
         target: str | None = None,
         k: int = 5,
+        recency_half_life_days: float | None = None,
     ) -> list[dict[str, Any]]:
         """Find source snippets at HEAD across every indexed target.
 
@@ -217,6 +237,9 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             target: Optional target name. Unset = coalesce across all
                 targets with cross-target dedup. Each hit carries its target.
             k: Max results to return.
+            recency_half_life_days: Accepted for API symmetry; effectively
+                a no-op for file-at-HEAD chunks (those artifacts are
+                excluded from recency decay).
         """
         with tracer().start_as_current_span("mcp.tool.find_code") as span:
             set_safe_attributes(
@@ -243,6 +266,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 target=target,
                 k=k,
                 expander=expander,
+                recency_half_life_days=_resolve_recency(recency_half_life_days),
             )
             _record_result_count(span, result)
             return result
@@ -255,6 +279,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         author_login: str | None = None,
         target: str | None = None,
         k: int = 5,
+        recency_half_life_days: float | None = None,
     ) -> list[dict[str, Any]]:
         """Find distilled code-pattern rules that apply to a coding task.
 
@@ -265,6 +290,10 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             author_login: Optional GH login to scope to personal style.
             target: Optional target name. Unset = coalesce across all targets.
             k: Max results to return.
+            recency_half_life_days: Accepted for API symmetry; effectively
+                a no-op for rule chunks (rule artifacts are excluded from
+                recency decay since they're synthesized recently from
+                heterogeneous-age sources).
         """
         with tracer().start_as_current_span("mcp.tool.find_applicable_rules") as span:
             set_safe_attributes(
@@ -289,6 +318,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 target=target,
                 k=k,
                 expander=expander,
+                recency_half_life_days=_resolve_recency(recency_half_life_days),
             )
             _record_result_count(span, result)
             return result

@@ -230,7 +230,14 @@ def run_query(
     mode: Mode,
     k: int = 5,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> list[q.SearchHit]:
+    """Run one eval query under one retrieval mode.
+
+    `recency_half_life_days` only affects `mode='hybrid'` — the bm25 and
+    vector legs are unweighted by design so each leg's contribution to a
+    side-by-side comparison stays interpretable.
+    """
     filters = _filters_for(query)
     if mode == "bm25":
         return q.bm25_search(
@@ -256,6 +263,7 @@ def run_query(
             filters=filters,
             k=k,
             expander=expander,
+            recency_half_life_days=recency_half_life_days,
         )
     raise ValueError(f"unknown mode {mode!r}")
 
@@ -269,8 +277,13 @@ def evaluate_search(
     k: int = 5,
     modes: Iterable[Mode] = ALL_MODES,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> SearchEvalReport:
-    """Run every query through every mode; build a flat outcome list."""
+    """Run every query through every mode; build a flat outcome list.
+
+    `recency_half_life_days` is forwarded only to the hybrid mode; see
+    `run_query` for the rationale.
+    """
     queries = list(queries)
     modes = list(modes)
     outcomes: list[QueryOutcome] = []
@@ -284,6 +297,7 @@ def evaluate_search(
                 mode=mode,
                 k=k,
                 expander=expander,
+                recency_half_life_days=recency_half_life_days,
             )
             passed = _query_passes(hits, sq.expect_any)
             outcomes.append(QueryOutcome(query=sq, mode=mode, passed=passed, top_hits=hits))

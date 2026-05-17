@@ -268,6 +268,58 @@ def test_expect_any_symbol_name_matches(conn):
 # ---------- aggregation ----------
 
 
+def test_evaluate_search_forwards_recency_to_hybrid_only(conn, monkeypatch):
+    """`evaluate_search` must pass `recency_half_life_days` into the hybrid
+    leg (so `gt eval search --recency-half-life-days=N` actually measures
+    something) and must NOT pass it to bm25_search or store.search
+    (per the eval's "each leg unweighted by design" contract).
+    """
+    from github_twin.eval import search_evals as se
+
+    captured: dict[str, list] = {"hybrid": [], "bm25": [], "vector": []}
+
+    def fake_hybrid(*args, **kwargs):
+        captured["hybrid"].append(kwargs.get("recency_half_life_days"))
+        return []
+
+    def fake_bm25(*args, **kwargs):
+        # bm25_search has no recency kwarg; failure would be a TypeError above.
+        assert "recency_half_life_days" not in kwargs
+        captured["bm25"].append(True)
+        return []
+
+    class SpyStore:
+        backend_id = "spy"
+
+        def search(self, vec, *, filters, k=5):
+            captured["vector"].append(True)
+            return []
+
+    monkeypatch.setattr(se, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(se.q, "bm25_search", fake_bm25)
+
+    sq = SearchQuery(
+        query="A query",
+        tool="find_style_examples",
+        tier=2,
+        expect_any=[Expectation(text_substr="x")],
+    )
+    se.evaluate_search(
+        conn,
+        FakeEmbedder(),
+        SpyStore(),
+        [sq],
+        k=3,
+        recency_half_life_days=365.0,
+    )
+
+    # All three legs ran exactly once.
+    assert captured["bm25"] == [True]
+    assert captured["vector"] == [True]
+    # Hybrid leg saw the recency kwarg with the value we passed.
+    assert captured["hybrid"] == [365.0]
+
+
 def test_pass_rate_by_tier_and_mode(conn):
     """Stage two Tier-1 queries — one passes only under vector, one only under
     BM25. Hybrid covers both, so hybrid pass rate is 2/2 while each single

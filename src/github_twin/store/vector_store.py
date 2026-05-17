@@ -20,9 +20,19 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from github_twin.store import queries as q
+
+# Artifact kinds whose `created_at` reflects a meaningful authoring/submission
+# time and therefore participate in recency decay. `file` is excluded because
+# file-at-HEAD artifacts are snapshots of current state; `rule` / `code_rule`
+# are synthesized recently from heterogeneous-age sources and would be
+# misweighted by their own `created_at`.
+_RECENCY_DECAYED_ARTIFACT_KINDS: frozenset[str] = frozenset(
+    {"commit", "pr", "review_comment", "issue_comment"}
+)
 
 log = logging.getLogger(__name__)
 
@@ -259,6 +269,8 @@ def hybrid_search(
     k: int = 5,
     fetch: int = HYBRID_FETCH,
     expander: Any | None = None,
+    recency_half_life_days: float | None = None,
+    now: datetime | None = None,
 ) -> list[q.SearchHit]:
     """Reciprocal Rank Fusion over `store.search` (vector) and `q.bm25_search`
     (keyword). Both retrievers see the same filter set; results are fused
@@ -274,6 +286,15 @@ def hybrid_search(
     already capture synonymy, so expansion there dilutes the dense match.
     `test_hybrid_search.py:test_hybrid_passes_raw_vec_when_expander_set`
     pins this contract.
+
+    Recency decay: when `recency_half_life_days` is set to a positive
+    number, the fused RRF score of each candidate is multiplied by
+    `0.5 ** (age_days / half_life_days)` before the final top-k slice.
+    `now` overrides the reference timestamp (used by tests). Decay applies
+    only to style-bearing artifact kinds (`commit`, `pr`, `review_comment`,
+    `issue_comment`); `file` and rule kinds are left untouched. Candidates
+    with NULL or unparseable `created_at` are also left untouched so an
+    undatable chunk isn't silently penalized.
     """
     vec_hits = store.search(query_vec, filters=filters, k=fetch)
     bm25_hits = q.bm25_search(
@@ -296,6 +317,23 @@ def hybrid_search(
     for rank, h in enumerate(bm25_hits):
         scores[h.chunk_id] = scores.get(h.chunk_id, 0.0) + 1.0 / (RRF_K + rank + 1)
         by_id.setdefault(h.chunk_id, h)
+
+    if recency_half_life_days and recency_half_life_days > 0 and scores:
+        ages = q.get_chunk_recency(conn, scores.keys())
+        ref = now or datetime.now(UTC)
+        for cid, score in scores.items():
+            created_at, artifact_kind = ages.get(cid, (None, ""))
+            if artifact_kind not in _RECENCY_DECAYED_ARTIFACT_KINDS or not created_at:
+                continue
+            try:
+                ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            age_days = max(0.0, (ref - ts).total_seconds() / 86400.0)
+            scores[cid] = score * (0.5 ** (age_days / recency_half_life_days))
+
     ranked = sorted(scores.items(), key=lambda x: -x[1])[:k]
     return [replace(by_id[cid], distance=1.0 - score) for cid, score in ranked]
 
