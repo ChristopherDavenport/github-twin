@@ -1234,6 +1234,83 @@ def eval_search(
 
 
 @app.command()
+def feedback(
+    note: str | None = typer.Option(
+        None,
+        "--note",
+        "-n",
+        help=(
+            "Free-text note for the discussion body. Pass `-` to read from stdin. "
+            "When omitted, you'll be prompted interactively."
+        ),
+    ),
+    title: str | None = typer.Option(
+        None, "--title", "-t", help="Discussion title. Default: 'github-twin feedback'."
+    ),
+    category: str | None = typer.Option(
+        None, "--category", help="GitHub discussion category slug, if your repo uses categories."
+    ),
+    repo: str = typer.Option(
+        "ChristopherDavenport/github-twin",
+        "--repo",
+        help="Target repo (owner/name) for the discussion. Override for forks.",
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the URL instead of opening it in a browser."
+    ),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """Open a prefilled GitHub Discussion with environment + corpus context.
+
+    Lowers feedback friction to one command: we collect `gt --version`, the
+    embed commitment, and per-target artifact / chunk / vector counts, run
+    the payload through the existing secret-redaction filter, and open a
+    `discussions/new?body=...` URL in your browser. Nothing is sent until
+    you hit Submit on the rendered GitHub page.
+    """
+    from github_twin.feedback import (
+        _embed_summary,
+        build_discussion_url,
+        collect_corpus,
+        collect_env,
+        render_body,
+        scrub_secrets,
+    )
+
+    if note == "-":
+        note_text = sys.stdin.read()
+    elif note is None:
+        note_text = typer.prompt(
+            "Your feedback (one line; multi-line: re-run with `--note -` and pipe stdin)",
+            default="",
+            show_default=False,
+        )
+    else:
+        note_text = note
+
+    cfg, conn = _ctx(config)
+    env = collect_env()
+    corpus = collect_corpus(conn)
+    body = render_body(env, _embed_summary(cfg.embed), corpus, note_text)
+    body = scrub_secrets(body)
+
+    url = build_discussion_url(
+        body=body,
+        title=title or "github-twin feedback",
+        category=category,
+        repo=repo,
+    )
+
+    console.print("[bold]Discussion URL:[/bold]")
+    console.print(url)
+
+    if not no_browser:
+        import webbrowser
+
+        webbrowser.open(url)
+
+
+@app.command()
 def serve(config: Path | None = typer.Option(None, "--config")) -> None:
     """Run the MCP server over stdio."""
     from github_twin.mcp_server.server import run

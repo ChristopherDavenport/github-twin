@@ -1,0 +1,55 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.christopherdavenport/github-twin",
+  "title": "github-twin",
+  "description": "Personal RAG over your GitHub history (commits, code, review comments), served to Claude Code over MCP. Tools include find_code, find_reviews, predict_review_outcome, house_rules, and developer_profile.",
+  "version": "0.0.4",
+  "repository": {
+    "url": "https://github.com/ChristopherDavenport/github-twin",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "github-twin",
+      "version": "0.0.4",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "GITHUB_TOKEN",
+          "description": "GitHub personal access token. Optional: github-twin can also pick the token up from `gh auth token` or from its own OAuth device-flow login (`gt auth login`).",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "description": "Optional. Enables the Claude backend for `gt summarize`, `gt distill`, and `gt eval`. Defaults to local Ollama when unset.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "GEMINI_API_KEY",
+          "description": "Optional. Enables the Gemini backend for embedding and the LLM seam. Vertex AI ADC via `GT_GEMINI_PROJECT` is also supported.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "GT_PATHS__DATA_DIR",
+          "description": "Optional. Override the on-disk data directory holding the SQLite index, embeddings, and cached GitHub responses. Defaults to `$XDG_DATA_HOME/github-twin`.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

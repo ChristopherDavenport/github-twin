@@ -3,7 +3,39 @@
 [![PyPI version](https://img.shields.io/pypi/v/github-twin.svg)](https://pypi.org/project/github-twin/)
 [![Python versions](https://img.shields.io/pypi/pyversions/github-twin.svg)](https://pypi.org/project/github-twin/)
 [![CI](https://github.com/ChristopherDavenport/github-twin/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristopherDavenport/github-twin/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/ChristopherDavenport/github-twin/branch/main/graph/badge.svg)](https://codecov.io/gh/ChristopherDavenport/github-twin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> You reviewed a permission check six months ago. Claude doesn't remember
+> it. **github-twin does** — it indexes your commits and review comments,
+> and surfaces them as retrieval hits whenever an agent writes or reviews
+> new code in your style.
+
+<!-- Demo assets: see docs/assets/README.md for recording recipes. -->
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="gt stats + gt eval search returning hits against a real corpus" width="800" />
+</p>
+<p align="center">
+  <img src="docs/assets/claude-code-screenshot.png" alt="Claude Code citing a past review comment via the find_review_comments tool" width="800" />
+</p>
+
+Try it now from Claude Code — drop this into `~/.claude.json` and reload:
+
+```json
+{
+  "mcpServers": {
+    "github-twin": { "command": "uvx", "args": ["github-twin", "serve"] }
+  }
+}
+```
+
+> **Your code stays on your box.** Embeddings are computed locally
+> (Ollama or sentence-transformers); only the LLM seam (`gt summarize`,
+> `gt distill`, `gt eval`) optionally calls a hosted provider, and even
+> that's swappable to local Ollama. The `gemini` embedder is the one
+> exception — opt-in only.
+
+---
 
 A personal RAG over your GitHub history, served to Claude Code (or any MCP
 client) as a stdio server. Two scopes, one codebase:
