@@ -115,11 +115,26 @@ Switching DBs between targets is done via `GT_PATHS__DATA_DIR=...`; one DB
 per `target` row by construction.
 
 The `gemini` embedder is the only backend that sends chunk text to a
-remote API. Pick it deliberately — it exists for users who have a Gemini
-API key (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) but neither Ollama nor the
-`[st]` extra available. Default model is `gemini-embedding-001` at 3072
-dims; `cfg.embed.dim` 1536 or 768 are also supported via the SDK's
-`output_dimensionality`.
+remote API. Pick it deliberately — it exists for users who have Gemini
+auth but neither Ollama nor the `[st]` extra available. Default model
+is `gemini-embedding-001` at 3072 dims; `cfg.embed.dim` 1536 or 768 are
+also supported via the SDK's `output_dimensionality`.
+
+Gemini auth has two paths, all four Gemini surfaces (embed, distill,
+summarize, eval) share them via `gemini_client.make_gemini_client`:
+1. **API key** — `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Wins when both
+   paths are configured.
+2. **Vertex AI + ADC** — set `GT_GEMINI_PROJECT` (and optionally
+   `GT_GEMINI_LOCATION`, default `us-central1`) and bootstrap once
+   with `gcloud auth application-default login`. The credential lives
+   on disk; no key in your shell. Requires `aiplatform.googleapis.com`
+   enabled on the project, and billing applies even for "free"
+   Gemini models (AI Studio free tier does NOT extend to Vertex).
+
+`has_gemini_auth()` in the same module is the predicate that lets the
+`auto` selector in `make_synthesizer` / `make_text_llm` consider Gemini
+eligible when only the project env is set. Env vars are read directly
+(not via pydantic-settings), so single underscores are intentional.
 
 The embedder backend is a per-DB commitment (`sqlite-vec` bakes the
 dim into the virtual table at first creation), so `gt init` accepts
@@ -249,7 +264,11 @@ Secret hygiene is enforced in two layers (`_logging.py`):
    `register_secret_value()` so they get the same scrubbing.
 
 Both are wired in `cli.py:_setup_logging`, so every CLI invocation
-(and every MCP server run) gets them.
+(and every MCP server run) gets them. `GT_GEMINI_PROJECT` is
+deliberately NOT in `_SECRET_ENV_VARS` — project IDs are visible
+diagnostic context, not credentials; ADC tokens live on disk at
+`~/.config/gcloud/application_default_credentials.json` and never
+appear in env. Pinned by `test_logging_redaction.py:test_gemini_project_env_not_treated_as_secret`.
 
 ## GitHub auth
 

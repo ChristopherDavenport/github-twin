@@ -6,8 +6,10 @@ doesn't fit free-form completions. This module exposes a smaller surface —
 underlying models (Claude / Gemini / Ollama) for arbitrary text.
 
 Backend selection mirrors `distill/synth.py:make_synthesizer`: Claude when
-`ANTHROPIC_API_KEY` is set, else Gemini when `GEMINI_API_KEY`/`GOOGLE_API_KEY`
-is set, else Ollama. Explicit `prefer=` overrides.
+`ANTHROPIC_API_KEY` is set, else Gemini when any Gemini auth path is configured
+(`GEMINI_API_KEY` / `GOOGLE_API_KEY`, or `GT_GEMINI_PROJECT` + ADC via
+`gcloud auth application-default login`), else Ollama. Explicit `prefer=`
+overrides.
 """
 
 from __future__ import annotations
@@ -48,11 +50,11 @@ class ClaudeText:
 
 class GeminiText:
     def __init__(self, *, model: str, api_key: str | None = None) -> None:
-        from google import genai
+        from github_twin.gemini_client import make_gemini_client
 
         self.model = model
         self.backend_id = f"gemini:{model}"
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self._client = make_gemini_client(api_key)
 
     def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
         from google.genai import types
@@ -92,10 +94,6 @@ class OllamaText:
         return content
 
 
-def _has_gemini_key() -> bool:
-    return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-
-
 def make_text_llm(
     *,
     claude_model: str = "claude-sonnet-4-6",
@@ -104,19 +102,26 @@ def make_text_llm(
     prefer: str = "auto",
 ) -> TextLLM:
     """Mirror of `make_synthesizer`. Same precedence: Claude > Gemini > Ollama."""
+    from github_twin.gemini_client import has_gemini_auth
+
     if prefer == "claude":
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("ANTHROPIC_API_KEY not set")
         return ClaudeText(model=claude_model)
     if prefer == "gemini":
-        if not _has_gemini_key():
-            raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
+        if not has_gemini_auth():
+            raise RuntimeError(
+                "Gemini requested but no auth available — set GEMINI_API_KEY or "
+                "GOOGLE_API_KEY for the API path, or set GT_GEMINI_PROJECT "
+                "(and optionally GT_GEMINI_LOCATION) after running "
+                "'gcloud auth application-default login' to use Vertex AI."
+            )
         return GeminiText(model=gemini_model)
     if prefer == "ollama":
         return OllamaText(model=ollama_model)
     # auto
     if os.environ.get("ANTHROPIC_API_KEY"):
         return ClaudeText(model=claude_model)
-    if _has_gemini_key():
+    if has_gemini_auth():
         return GeminiText(model=gemini_model)
     return OllamaText(model=ollama_model)

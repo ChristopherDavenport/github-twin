@@ -235,6 +235,7 @@ def test_make_synthesizer_picks_claude_when_only_anthropic_set(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GT_GEMINI_PROJECT", raising=False)
     s = make_synthesizer(claude_model="claude-test", gemini_model="g", ollama_model="o")
     assert isinstance(s, ClaudeSynthesizer)
 
@@ -242,6 +243,25 @@ def test_make_synthesizer_picks_claude_when_only_anthropic_set(monkeypatch):
 def test_make_synthesizer_picks_gemini_when_only_google_set(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "gk-test")
+    monkeypatch.delenv("GT_GEMINI_PROJECT", raising=False)
+    s = make_synthesizer(claude_model="c", gemini_model="gemini-test", ollama_model="o")
+    assert isinstance(s, GeminiSynthesizer)
+    assert s.backend_id == "gemini:gemini-test"
+
+
+def test_make_synthesizer_picks_gemini_when_only_adc_project_set(monkeypatch):
+    """ADC fallback: a user with only `gcloud auth application-default login`
+    and `GT_GEMINI_PROJECT` should still land on Gemini in `auto` mode."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GT_GEMINI_PROJECT", "my-proj")
+    # Avoid hitting google.genai's real Client constructor (which would try to
+    # reach for ADC on disk). GeminiSynthesizer lazily imports the helper,
+    # which lazily imports google.genai — patch the leaf factory.
+    from google import genai
+
+    monkeypatch.setattr(genai, "Client", lambda **kw: object())
     s = make_synthesizer(claude_model="c", gemini_model="gemini-test", ollama_model="o")
     assert isinstance(s, GeminiSynthesizer)
     assert s.backend_id == "gemini:gemini-test"
@@ -251,6 +271,7 @@ def test_make_synthesizer_falls_back_to_ollama_when_no_keys(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GT_GEMINI_PROJECT", raising=False)
     s = make_synthesizer(claude_model="c", gemini_model="g", ollama_model="llama-test")
     assert isinstance(s, OllamaSynthesizer)
     assert s.backend_id == "ollama:llama-test"
@@ -259,8 +280,13 @@ def test_make_synthesizer_falls_back_to_ollama_when_no_keys(monkeypatch):
 def test_make_synthesizer_forced_gemini_errors_without_key(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+    monkeypatch.delenv("GT_GEMINI_PROJECT", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
         make_synthesizer(claude_model="c", gemini_model="g", ollama_model="o", prefer="gemini")
+    msg = str(exc_info.value)
+    # Both auth paths must be named so the user knows their options.
+    assert "GEMINI_API_KEY" in msg
+    assert "GT_GEMINI_PROJECT" in msg
 
 
 def test_make_synthesizer_claude_beats_gemini_in_auto(monkeypatch):
