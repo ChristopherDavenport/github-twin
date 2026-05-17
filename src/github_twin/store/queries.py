@@ -944,6 +944,42 @@ def bm25_search(
     return hits
 
 
+# ---------- Recency lookup ----------
+
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk 500 to stay well clear
+# even after we add a few extra slots elsewhere in the future.
+_RECENCY_BATCH = 500
+
+
+def get_chunk_recency(
+    conn: sqlite3.Connection, chunk_ids: Iterable[int]
+) -> dict[int, tuple[str | None, str]]:
+    """Return `{chunk_id: (artifact.created_at, artifact.kind)}`.
+
+    Used by `hybrid_search` to apply recency decay across the fused
+    candidate set in one batched SQL call instead of per-hit joins.
+    Chunks whose artifact has no `created_at` come back as `(None, kind)`
+    and the caller decides how to handle them (current policy: don't
+    penalize undatable chunks).
+    """
+    ids = [int(cid) for cid in chunk_ids]
+    if not ids:
+        return {}
+    out: dict[int, tuple[str | None, str]] = {}
+    for i in range(0, len(ids), _RECENCY_BATCH):
+        batch = ids[i : i + _RECENCY_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT c.id AS chunk_id, a.created_at, a.kind "
+            f"FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+            f"WHERE c.id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for r in rows:
+            out[r["chunk_id"]] = (r["created_at"], r["kind"])
+    return out
+
+
 # ---------- Developer profile (cache + sampling) ----------
 
 
