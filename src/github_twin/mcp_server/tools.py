@@ -71,9 +71,17 @@ def _hybrid(
     filters: VectorSearchFilters,
     k: int,
     expander: QueryExpander | None,
+    recency_half_life_days: float | None = None,
 ) -> list[q.SearchHit]:
     """`hybrid_search` wrapped in a span that records result count and
-    top distance."""
+    top distance.
+
+    `recency_half_life_days` is forwarded as-is: None / 0 disables the
+    re-rank, a positive float halves a candidate's RRF score every N
+    days of age (style-bearing artifact kinds only). The MCP layer is
+    responsible for resolving config defaults vs. caller overrides
+    before this helper is called.
+    """
     with tracer().start_as_current_span("retrieval.hybrid_search") as span:
         set_safe_attributes(
             span,
@@ -84,6 +92,7 @@ def _hybrid(
                 "gh_twin.retrieval.expander": (
                     expander.backend_id if expander is not None else "off"
                 ),
+                "gh_twin.retrieval.recency_half_life_days": recency_half_life_days,
             },
         )
         hits = hybrid_search(
@@ -94,6 +103,7 @@ def _hybrid(
             filters=filters,
             k=k,
             expander=expander,
+            recency_half_life_days=recency_half_life_days,
         )
         span.set_attribute("gh_twin.retrieval.hits", len(hits))
         if hits:
@@ -114,6 +124,7 @@ def find_review_comments(
     scope: Scope = "all",
     k: int = 5,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return up to k past review comments on diffs that look like `diff_hunk`.
 
@@ -142,6 +153,7 @@ def find_review_comments(
         ),
         k=k,
         expander=expander,
+        recency_half_life_days=recency_half_life_days,
     )
     out: list[dict[str, Any]] = []
     for h in hits:
@@ -193,6 +205,7 @@ def find_style_examples(
     scope: Scope = "all",
     k: int = 5,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return up to k code chunks matching `query`. Multi-target aware:
     `target` narrows to one target; unset coalesces across all."""
@@ -216,6 +229,7 @@ def find_style_examples(
         ),
         k=k,
         expander=expander,
+        recency_half_life_days=recency_half_life_days,
     )
     out: list[dict[str, Any]] = []
     for h in hits:
@@ -368,8 +382,17 @@ def find_applicable_rules(
     target: str | None = None,
     k: int = 5,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k distilled code-pattern rules most relevant to `query`."""
+    """Return up to k distilled code-pattern rules most relevant to `query`.
+
+    `recency_half_life_days` is accepted for API symmetry with the other
+    retrieval tools but is effectively a no-op for `code_rule` chunks:
+    rules ride on `artifact.kind='rule'`, which is excluded from the
+    decayed set in `hybrid_search` (rules are synthesized recently from
+    heterogeneous-age sources, so dating them by `artifact.created_at`
+    is misleading).
+    """
     if not query.strip():
         return []
     target_id = _lookup_target_id(conn, target)
@@ -388,6 +411,7 @@ def find_applicable_rules(
         ),
         k=k,
         expander=expander,
+        recency_half_life_days=recency_half_life_days,
     )
     out: list[dict[str, Any]] = []
     for h in hits:
@@ -417,8 +441,15 @@ def find_code(
     target: str | None = None,
     k: int = 5,
     expander: QueryExpander | None = None,
+    recency_half_life_days: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k file-at-HEAD snippets matching `query`."""
+    """Return up to k file-at-HEAD snippets matching `query`.
+
+    `recency_half_life_days` is accepted for API symmetry but is a no-op
+    here: file-at-HEAD chunks ride on `artifact.kind='file'`, which is
+    excluded from the decayed set in `hybrid_search` (file snapshots
+    represent current state, not an authoring date).
+    """
     if not query.strip():
         return []
     target_id = _lookup_target_id(conn, target)
@@ -439,6 +470,7 @@ def find_code(
         ),
         k=sql_k,
         expander=expander,
+        recency_half_life_days=recency_half_life_days,
     )
     out: list[dict[str, Any]] = []
     for h in hits:
