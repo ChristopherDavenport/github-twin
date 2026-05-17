@@ -141,8 +141,16 @@ API key is set), or you can force one explicitly.
 | Provider | Env var | What it covers |
 |---|---|---|
 | Anthropic (Claude) | `ANTHROPIC_API_KEY` | Distill / summarize / eval LLM. Best quality. |
-| Google (Gemini) | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Distill / summarize / eval LLM. Free tier is generous. |
+| Google (Gemini, API key) | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Distill / summarize / eval LLM. Free tier is generous. |
+| Google (Gemini, Vertex / ADC) | `GT_GEMINI_PROJECT` (+ optional `GT_GEMINI_LOCATION`, default `us-central1`) | Same backends, but auth via `gcloud auth application-default login` — no key in your shell. API key wins if both are set. |
 | Ollama (local) | `OLLAMA_HOST` (default `http://127.0.0.1:11434`) | Distill / summarize / eval LLM. Fully offline. |
+
+The Vertex / ADC path needs the `aiplatform.googleapis.com` API enabled
+on your project, and **billing applies even for "free" Gemini models** —
+the AI Studio free tier does not extend to Vertex. Project IDs are not
+secrets; the credential itself lives at
+`~/.config/gcloud/application_default_credentials.json` and is refreshed
+by gcloud.
 
 ### Embedder backends
 
@@ -155,10 +163,12 @@ We keep the embedder backend separate from the LLM backend. Choose one:
   want a specific HuggingFace model. Local.
 - **Alternative — Gemini** (`gemini-embedding-001` at 3072-dim by
   default). Uses the `google-genai` dep that's already installed; auth
-  via `GEMINI_API_KEY` or `GOOGLE_API_KEY`. **Remote** — this is the
-  only embedder that sends chunk text off-box. Pick it when you have a
-  Gemini key but no Ollama / `[st]` install, and your corpus is okay
-  to share with Google.
+  via `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or via `GT_GEMINI_PROJECT`
+  + ADC (`gcloud auth application-default login`) to route through
+  Vertex AI without managing a key. **Remote** — this is the only
+  embedder that sends chunk text off-box. Pick it when you have Gemini
+  auth but no Ollama / `[st]` install, and your corpus is okay to
+  share with Google.
 
 The embedder is a per-DB commitment — `sqlite-vec` bakes the vector
 dimension into the table at first creation. Stamp the choice into
@@ -252,8 +262,8 @@ Use `github-twin <command>` interchangeably with `gt <command>`.
 
 | Surface | Env / config key | Default | Alt |
 |---|---|---|---|
-| LLM (`cfg.distill.backend`, `cfg.summarize.backend`) | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / Ollama | `auto` (cloud > local) | force `claude` / `gemini` / `ollama` |
-| Embedder (`cfg.embed.backend`) | — / `GEMINI_API_KEY` | `ollama` (`nomic-embed-text`) | `sentence_transformers` via `[st]` extra, or `gemini` (`gemini-embedding-001`, remote) |
+| LLM (`cfg.distill.backend`, `cfg.summarize.backend`) | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (or `GT_GEMINI_PROJECT` + ADC) / Ollama | `auto` (cloud > local) | force `claude` / `gemini` / `ollama` |
+| Embedder (`cfg.embed.backend`) | — / `GEMINI_API_KEY` (or `GT_GEMINI_PROJECT` + ADC) | `ollama` (`nomic-embed-text`) | `sentence_transformers` via `[st]` extra, or `gemini` (`gemini-embedding-001`, remote) |
 | Vector store (`cfg.vector_store.backend`) | — | `sqlite-vec` (brute-force KNN) | `faiss` via `[faiss]` extra |
 | BM25 query expansion (`cfg.retrieval.query_expansion`) | — | `rule` (deterministic) | `ollama` (LLM, cached) or `off` |
 
