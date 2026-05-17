@@ -115,3 +115,87 @@ def test_gemini_embedder_truncates_to_max_chars(monkeypatch: pytest.MonkeyPatch)
     emb.embed([huge])
     sent = fake.models.calls[0]["contents"][0]
     assert len(sent) == MAX_CHARS
+
+
+# --- ADC / Vertex auth path ---------------------------------------------------
+
+
+def _capture_client_kwargs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Patch google.genai.Client to record every constructor kwarg dict."""
+    seen: list[dict[str, Any]] = []
+
+    def _factory(*args: Any, **kwargs: Any) -> _FakeClient:
+        seen.append(kwargs)
+        return _FakeClient()
+
+    from google import genai
+
+    monkeypatch.setattr(genai, "Client", _factory)
+    return seen
+
+
+def test_gemini_embedder_api_key_path_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API key wins even when GT_GEMINI_PROJECT is also set."""
+    monkeypatch.setenv("GT_GEMINI_PROJECT", "fake-proj")
+    monkeypatch.setenv("GT_GEMINI_LOCATION", "europe-west4")
+    seen = _capture_client_kwargs(monkeypatch)
+
+    from github_twin.embed.gemini import GeminiEmbedder
+
+    GeminiEmbedder(model=GEMINI_MODEL, dim=GEMINI_DIM, api_key="real-key")
+    assert seen == [{"api_key": "real-key"}]
+
+
+def test_gemini_embedder_falls_back_to_vertex_adc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No api_key + GT_GEMINI_PROJECT set => vertexai=True path."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GT_GEMINI_PROJECT", "my-proj")
+    monkeypatch.delenv("GT_GEMINI_LOCATION", raising=False)
+    seen = _capture_client_kwargs(monkeypatch)
+
+    from github_twin.embed.gemini import GeminiEmbedder
+
+    GeminiEmbedder(model=GEMINI_MODEL, dim=GEMINI_DIM)
+    assert seen == [
+        {"vertexai": True, "project": "my-proj", "location": "us-central1"},
+    ]
+
+
+def test_gemini_embedder_vertex_honors_custom_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GT_GEMINI_PROJECT", "my-proj")
+    monkeypatch.setenv("GT_GEMINI_LOCATION", "europe-west4")
+    seen = _capture_client_kwargs(monkeypatch)
+
+    from github_twin.embed.gemini import GeminiEmbedder
+
+    GeminiEmbedder(model=GEMINI_MODEL, dim=GEMINI_DIM)
+    assert seen == [
+        {"vertexai": True, "project": "my-proj", "location": "europe-west4"},
+    ]
+
+
+def test_gemini_embedder_no_auth_calls_bare_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without any auth env, the helper still calls bare genai.Client()
+    so the SDK's own env auto-config remains the source of truth.
+    """
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GT_GEMINI_PROJECT", raising=False)
+    monkeypatch.delenv("GT_GEMINI_LOCATION", raising=False)
+    seen = _capture_client_kwargs(monkeypatch)
+
+    from github_twin.embed.gemini import GeminiEmbedder
+
+    GeminiEmbedder(model=GEMINI_MODEL, dim=GEMINI_DIM)
+    assert seen == [{}]

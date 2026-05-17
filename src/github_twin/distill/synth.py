@@ -213,13 +213,14 @@ class GeminiSynthesizer:
         api_key: str | None = None,
         system_prompt: str = SYSTEM_PROMPT,
     ) -> None:
-        from google import genai
+        from github_twin.gemini_client import make_gemini_client
 
         self.model = model
         self.backend_id = f"gemini:{model}"
         self.system_prompt = system_prompt
-        # SDK reads GOOGLE_API_KEY / GEMINI_API_KEY from env if api_key is None.
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        # API key wins if set; otherwise falls back to ADC via GT_GEMINI_PROJECT,
+        # else the SDK's own env auto-config. See gemini_client.make_gemini_client.
+        self._client = make_gemini_client(api_key)
 
     def synthesize(self, cluster: list[dict[str, Any]]) -> RuleResult:
         from google.genai import types
@@ -277,10 +278,6 @@ class OllamaSynthesizer:
 # ---------- Factory ----------
 
 
-def _has_gemini_key() -> bool:
-    return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-
-
 def make_synthesizer(
     *,
     claude_model: str,
@@ -299,9 +296,11 @@ def make_synthesizer(
     `system_prompt` selects the synthesis flavor — defaults to the review-comment
     prompt; pass `CODE_SYSTEM_PROMPT` for code-pattern rules.
     """
+    from github_twin.gemini_client import has_gemini_auth
+
     prefer = (prefer or "auto").lower()
     has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    has_gemini = _has_gemini_key()
+    has_gemini = has_gemini_auth()
 
     if prefer == "claude":
         if not has_claude:
@@ -312,7 +311,10 @@ def make_synthesizer(
     if prefer == "gemini":
         if not has_gemini:
             raise RuntimeError(
-                "Gemini requested but neither GEMINI_API_KEY nor GOOGLE_API_KEY is set."
+                "Gemini requested but no auth available — set GEMINI_API_KEY or "
+                "GOOGLE_API_KEY for the API path, or set GT_GEMINI_PROJECT "
+                "(and optionally GT_GEMINI_LOCATION) after running "
+                "'gcloud auth application-default login' to use Vertex AI."
             )
         log.info("using Gemini synthesizer: %s", gemini_model)
         return GeminiSynthesizer(model=gemini_model, system_prompt=system_prompt)
@@ -334,7 +336,7 @@ def make_synthesizer(
         return GeminiSynthesizer(model=gemini_model, system_prompt=system_prompt)
     model = ollama_model or "llama3.2"
     log.info(
-        "using Ollama synthesizer: %s (no ANTHROPIC_API_KEY / GEMINI_API_KEY found)",
+        "using Ollama synthesizer: %s (no ANTHROPIC_API_KEY / Gemini auth found)",
         model,
     )
     return OllamaSynthesizer(model=model, system_prompt=system_prompt)

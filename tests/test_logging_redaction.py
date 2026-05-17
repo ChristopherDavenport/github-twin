@@ -110,6 +110,19 @@ def test_anthropic_and_gemini_keys_scrubbed(monkeypatch: pytest.MonkeyPatch):
     assert out.count("***REDACTED***") == 2
 
 
+def test_gemini_project_env_not_treated_as_secret(monkeypatch: pytest.MonkeyPatch):
+    """`GT_GEMINI_PROJECT` carries a GCP project ID — visible context, not a
+    credential. ADC tokens live on disk, never in env. Guard against a future
+    well-meaning addition to _SECRET_ENV_VARS hiding diagnostic context."""
+    monkeypatch.setenv("GT_GEMINI_PROJECT", "my-research-project-1234")
+    flt = SecretRedactingFilter()
+    log, buf = _capture_logger(flt)
+    log.info("using Gemini project my-research-project-1234")
+    out = buf.getvalue()
+    assert "my-research-project-1234" in out
+    assert "REDACTED" not in out
+
+
 # ---------- format-args handling ----------
 
 

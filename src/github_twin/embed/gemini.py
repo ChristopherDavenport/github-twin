@@ -12,6 +12,13 @@ if you have a license / agreement that permits the transfer.
 
 Auth: the Gemini SDK reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the
 environment when `api_key=None`. Pass `api_key` explicitly to override.
+Alternatively, set `GT_GEMINI_PROJECT` (optionally with `GT_GEMINI_LOCATION`,
+default `us-central1`) and bootstrap Application Default Credentials via
+`gcloud auth application-default login` to route through Vertex AI without
+managing a key. The API-key path takes precedence when both are set. See
+`github_twin.gemini_client.make_gemini_client` for the shared precedence
+rule. Note: on Vertex, stick to model names that exist on both surfaces
+(`gemini-embedding-001` is fine; `text-embedding-005` is Vertex-only).
 
 Defaults aimed at `gemini-embedding-001` (3072-dim, the highest-quality
 general embedding model). Set `cfg.embed.dim` to 1536 or 768 to request
@@ -49,14 +56,14 @@ class GeminiEmbedder:
         max_chars: int = MAX_CHARS,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
-        from google import genai
+        from github_twin.gemini_client import make_gemini_client
 
         self.model = model
         self.dim = dim
         self.model_id = f"gemini:{model}"
         self._max_chars = max_chars
         self._batch_size = batch_size
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self._client = make_gemini_client(api_key)
         self._dim_verified = False
 
     def embed(self, texts: list[str]) -> list[list[float]]:
