@@ -38,10 +38,13 @@ from github_twin.store.db import open_db, transaction
 from github_twin.store.query_expansion import expander_from_config, make_expander
 from github_twin.store.vector_store import make_vector_store
 from github_twin.target import (
+    AmbiguousTargetError,
+    Target,
     discover_org,
     discover_repo,
     discover_user,
     load_target,
+    load_targets,
     maybe_discover_repo,
     save_target,
 )
@@ -62,9 +65,15 @@ auth_app = typer.Typer(
     no_args_is_help=True,
     help="Acquire and manage a GitHub OAuth token via device flow.",
 )
+targets_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Manage the targets (user / org / repo) tracked in this DB.",
+)
 app.add_typer(clones_app, name="clones")
 app.add_typer(eval_app, name="eval")
 app.add_typer(auth_app, name="auth")
+app.add_typer(targets_app, name="targets")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -72,12 +81,7 @@ log = logging.getLogger(__name__)
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(name)s | %(message)s")
-    # `--verbose` lifts everything to DEBUG; cap third-party loggers
-    # that log full request/response data with secrets in them.
     cap_noisy_loggers()
-    # Defense in depth: scrub `Bearer <tok>` / `Authorization: ...` /
-    # exact env-secret values out of any log record before handlers
-    # render it. Idempotent.
     install_secret_redaction()
 
 
@@ -85,6 +89,26 @@ def _ctx(config_path: Path | None) -> tuple[Config, sqlite3.Connection]:
     cfg = load_config(config_path)
     conn = open_db(cfg.paths.db_path, cfg.embed.dim)
     return cfg, conn
+
+
+def _resolve_target_arg(conn: sqlite3.Connection, target_arg: str | None) -> Target | None:
+    """Translate `--target NAME` into a Target row. None means
+    "no narrowing" and the caller decides what that implies (often:
+    iterate all)."""
+    if target_arg is None:
+        return None
+    try:
+        t = load_target(conn, name=target_arg)
+    except AmbiguousTargetError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
+    if t is None:
+        console.print(
+            f"[red]No target named {target_arg!r}. "
+            "Run `gt targets list` to see what's in this DB.[/red]"
+        )
+        raise typer.Exit(2)
+    return t
 
 
 def _resolve_embed_defaults(
@@ -123,15 +147,7 @@ def _persist_embed_config(
     model: str,
     dim: int,
 ) -> None:
-    """Write a `[embed]` block into the given config.toml.
-
-    Behavior:
-      * file absent: create it with just the `[embed]` block.
-      * file present, no `[embed]` block: append the block.
-      * file present, `[embed]` block matches the requested values: no-op.
-      * file present, `[embed]` block differs: raise `typer.BadParameter`
-        — refuse to silently overwrite hand-edited config.
-    """
+    """Write a `[embed]` block into the given config.toml. See module docs."""
     new_block = f'[embed]\nbackend = "{backend}"\nmodel = "{model}"\ndim = {int(dim)}\n'
     if not config_path.exists():
         config_path.write_text(new_block, encoding="utf-8")
@@ -178,7 +194,6 @@ def _run_ingest_safely(
 
 
 def _version_callback(value: bool) -> None:
-    # Eager flag: print and exit before Typer tries to dispatch a subcommand.
     if value:
         from github_twin import __version__
 
@@ -198,10 +213,6 @@ def main(
     ),
 ) -> None:
     _setup_logging(verbose)
-    # Auto-detected from OTEL_EXPORTER_OTLP_*ENDPOINT env vars. Returns
-    # False (noop) when env vars aren't set or the `[otel]` extra isn't
-    # installed; never raises. Safe to call before every subcommand —
-    # `init_otel` is idempotent.
     init_otel()
 
 
@@ -212,7 +223,8 @@ def init(
         "--kind",
         help=(
             "'auto' (default): pick repo-mode if pwd is a github.com working tree, "
-            "else user-mode. 'user' | 'org' | 'repo' to force a kind."
+            "else user-mode. 'user' | 'org' | 'repo' to force a kind. Additive: "
+            "each `gt init` adds another target to the DB."
         ),
     ),
     org: str | None = typer.Option(None, "--org", help="Org login. Required when --kind=org."),
@@ -244,10 +256,12 @@ def init(
     ),
     config: Path | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
-    """Discover the target (a user, an org, or a single repo) and open the DB."""
-    # Stamp embed config BEFORE _ctx — _ctx's open_db bakes cfg.embed.dim
-    # into the sqlite-vec table at first creation; once set, it can only
-    # be changed by recreating the DB.
+    """Add a target (user / org / repo) to this DB.
+
+    Additive — call multiple times to layer targets in one DB (e.g. your
+    user-mode + multiple orgs). Re-running with the same (kind, name)
+    refreshes that target in place.
+    """
     if embed_backend is not None or embed_model is not None or embed_dim is not None:
         resolved_backend, resolved_model, resolved_dim = _resolve_embed_defaults(
             embed_backend, embed_model, embed_dim
@@ -261,17 +275,17 @@ def init(
     cfg, conn = _ctx(config)
     kind = kind.lower()
 
-    # --- auto-detect: try repo, fall back to user ---
     if kind == "auto":
         with GitHubClient() as gh:
             auto = maybe_discover_repo(gh)
             if auto is not None:
                 target, metadata = auto
                 with transaction(conn):
-                    save_target(conn, target)
-                    q.upsert_repo(conn, **metadata)
+                    target = save_target(conn, target)
+                    assert target.id is not None
+                    q.upsert_repo(conn, target_id=target.id, **metadata)
                 console.print(
-                    f"[bold]Target:[/bold] repo {target.name} "
+                    f"[bold]Added:[/bold] repo {target.name} "
                     f"(id {target.external_id}) [dim](auto-detected)[/dim]"
                 )
                 console.print(f"Default branch: {metadata['default_branch']}")
@@ -284,8 +298,8 @@ def init(
         with GitHubClient() as gh:
             target = discover_user(gh, cfg.identity)
         with transaction(conn):
-            save_target(conn, target)
-        console.print(f"[bold]Target:[/bold] user {target.name} (id {target.external_id})")
+            target = save_target(conn, target)
+        console.print(f"[bold]Added:[/bold] user {target.name} (id {target.external_id})")
         console.print("[bold]Emails discovered:[/bold]")
         for e in target.emails:
             console.print(f"  • {e}")
@@ -296,8 +310,9 @@ def init(
         with GitHubClient() as gh:
             target = discover_org(gh, org)
             with transaction(conn):
-                save_target(conn, target)
-            console.print(f"[bold]Target:[/bold] org {target.name} (id {target.external_id})")
+                target = save_target(conn, target)
+            assert target.id is not None
+            console.print(f"[bold]Added:[/bold] org {target.name} (id {target.external_id})")
             console.print(
                 f"Discovering repos in {target.name} "
                 f"(include={cfg.ingest.include_repos or '*'}, "
@@ -311,13 +326,9 @@ def init(
                     include=cfg.ingest.include_repos,
                     exclude=cfg.ingest.exclude_repos,
                 ):
-                    q.upsert_repo(conn, **r)
+                    q.upsert_repo(conn, target_id=target.id, **r)
                     n_kept += 1
             console.print(f"Repos saved: [bold]{n_kept}[/bold] (filters applied).")
-        console.print(
-            "[yellow]Note:[/yellow] file walk + per-repo commits/reviews land "
-            "in phases O-C and O-D."
-        )
     elif kind == "repo":
         with GitHubClient() as gh:
             try:
@@ -326,9 +337,10 @@ def init(
                 console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(2) from None
         with transaction(conn):
-            save_target(conn, target)
-            q.upsert_repo(conn, **metadata)
-        console.print(f"[bold]Target:[/bold] repo {target.name} (id {target.external_id})")
+            target = save_target(conn, target)
+            assert target.id is not None
+            q.upsert_repo(conn, target_id=target.id, **metadata)
+        console.print(f"[bold]Added:[/bold] repo {target.name} (id {target.external_id})")
         console.print(f"Default branch: {metadata['default_branch']}")
     else:
         console.print(f"[red]Unknown --kind: {kind!r}. Expected 'user', 'org', or 'repo'.[/red]")
@@ -352,24 +364,21 @@ def init_claude_md(
     server_name: str = typer.Option(
         "github-twin",
         "--server-name",
-        help="MCP server name as registered in ~/.claude.json. Used to template the tool-call names in the output.",
+        help="MCP server name as registered in ~/.claude.json.",
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
     """Write a `CLAUDE.md` template wired to the github-twin MCP tools.
 
-    Reads the current target (via `gt init`) so the template addresses
-    the right user / org / repo. If no target is set, falls back to a
-    generic placeholder.
+    Reads every target currently in the DB so the template can list them
+    and document how to scope tool calls.
     """
     from datetime import date as _date
 
     from github_twin.templates.claude_md import render
 
     cfg, conn = _ctx(config)
-    target = load_target(conn)
-    target_name = target.name if target is not None else "(none — run `gt init` first)"
-
+    targets = load_targets(conn)
     if output.exists() and not overwrite:
         console.print(
             f"[red]{output} already exists.[/red] "
@@ -378,18 +387,72 @@ def init_claude_md(
         raise typer.Exit(1)
 
     content = render(
-        target_name=target_name,
+        targets=targets,
         server_name=server_name,
         date=_date.today().isoformat(),
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(content)
     console.print(f"[bold]Wrote[/bold] {output} ({len(content)} chars).")
-    if target is None:
+    if not targets:
         console.print(
-            "[yellow]No target found — the file uses a placeholder name. "
-            "Run `gt init` then re-run with --overwrite to fill it in.[/yellow]"
+            "[yellow]No targets found — the file uses placeholders. "
+            "Run `gt init` then re-run with --overwrite.[/yellow]"
         )
+
+
+# ---------- gt targets ----------
+
+
+@targets_app.command("list")
+def targets_list(config: Path | None = typer.Option(None, "--config")) -> None:
+    """List every target in this DB."""
+    _cfg, conn = _ctx(config)
+    targets = load_targets(conn)
+    if not targets:
+        console.print("[yellow]No targets. Run `gt init` first.[/yellow]")
+        return
+    t = Table(title=f"Targets ({len(targets)})")
+    t.add_column("id", justify="right")
+    t.add_column("kind")
+    t.add_column("name")
+    t.add_column("external_id", justify="right")
+    t.add_column("emails")
+    for target in targets:
+        t.add_row(
+            str(target.id),
+            target.kind,
+            target.name,
+            str(target.external_id),
+            str(len(target.emails)) if target.is_user else "—",
+        )
+    console.print(t)
+
+
+@targets_app.command("remove")
+def targets_remove(
+    name: str = typer.Argument(..., help="Target name to remove."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """Delete a target and every artifact / chunk / vector it owns."""
+    _cfg, conn = _ctx(config)
+    try:
+        target = load_target(conn, name=name)
+    except AmbiguousTargetError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
+    if target is None or target.id is None:
+        console.print(f"[red]No target named {name!r}.[/red]")
+        raise typer.Exit(1)
+    if not yes:
+        confirm = typer.confirm(f"Delete {target.kind} target {target.name} and all its data?")
+        if not confirm:
+            console.print("[dim]aborted[/dim]")
+            raise typer.Exit(0)
+    with transaction(conn):
+        q.delete_target(conn, target.id)
+    console.print(f"[green]✓ removed {target.kind} {target.name}[/green]")
 
 
 # ---------- gt auth ----------
@@ -412,13 +475,7 @@ def auth_login(
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Acquire a GitHub access token via OAuth device flow and persist it.
-
-    Token is stored in the OS keyring when available, otherwise a 0600
-    file under <data_dir>/auth/token.json. After login, `gt`'s GitHub
-    auth resolution prefers this token over `gh auth token` and
-    GITHUB_TOKEN.
-    """
+    """Acquire a GitHub access token via OAuth device flow and persist it."""
     import webbrowser
 
     from github_twin.ingest import auth_storage, oauth
@@ -433,7 +490,8 @@ def auth_login(
     console.print(f"[bold]Visit:[/bold] {code.verification_uri}")
     console.print(f"[bold]Code:[/bold] [cyan]{code.user_code}[/cyan]")
     console.print(
-        f"[dim](or open the pre-filled URL: {code.verification_uri_complete or code.verification_uri})[/dim]"
+        f"[dim](or open the pre-filled URL: "
+        f"{code.verification_uri_complete or code.verification_uri})[/dim]"
     )
     console.print()
 
@@ -455,7 +513,6 @@ def auth_login(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from None
 
-    # Identify the user the token belongs to (for status display).
     login: str | None = None
     try:
         with GitHubClient(token=token) as gh:
@@ -484,7 +541,7 @@ def auth_status(config: Path | None = typer.Option(None, "--config")) -> None:
 
     from github_twin.ingest import auth_storage
 
-    _ = load_config(config)  # ensure data_dir resolution is consistent
+    _ = load_config(config)
 
     persisted = auth_storage.describe_source()
     gh_available = shutil.which("gh") is not None
@@ -559,10 +616,14 @@ def ingest(
     commits_only: bool = typer.Option(False, "--commits-only"),
     reviews_only: bool = typer.Option(False, "--reviews-only"),
     limit: int | None = typer.Option(None, help="Cap items per source (debug)"),
+    target: str | None = typer.Option(
+        None, "--target", help="Restrict to one target (by name). Default: all."
+    ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Fetch new commits + review comments."""
+    """Fetch new commits + review comments. Iterates all targets unless --target."""
     cfg, conn = _ctx(config)
+    target_filter = _resolve_target_arg(conn, target)
     _run_ingest_safely(
         cfg,
         conn,
@@ -570,6 +631,7 @@ def ingest(
         commits_only=commits_only,
         reviews_only=reviews_only,
         limit=limit,
+        target=target_filter.id if target_filter else None,
     )
 
 
@@ -622,12 +684,7 @@ def summarize(
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Generate LLM summaries for code chunks (used by embed-time prefix).
-
-    Output lands in `chunk.summary`. After running, `gt embed` will pick
-    up the new prefix and (via EMBED_TEXT_VERSION) re-embed the corpus
-    so the vector index sees the summaries.
-    """
+    """Generate LLM summaries for code chunks (used by embed-time prefix)."""
     cfg, conn = _ctx(config)
     if backend is not None:
         cfg = cfg.model_copy(
@@ -651,84 +708,122 @@ def sync(
     skip_summarize: bool = typer.Option(
         False,
         "--skip-summarize",
-        help="Don't auto-run summarize before embed. Useful when you only want to ingest deltas.",
+        help="Don't auto-run summarize before embed.",
+    ),
+    target: str | None = typer.Option(
+        None, "--target", help="Restrict to one target (by name). Default: all."
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Incremental: ingest deltas, summarize new code chunks, then embed."""
+    """Incremental: ingest deltas, summarize new code chunks, then embed.
+
+    Without `--target`, iterates every target in the DB and runs ingest
+    for each. Summarize + embed are corpus-wide and run once at the end.
+    """
     cfg, conn = _ctx(config)
-    _run_ingest_safely(cfg, conn, since=since, commits_only=False, reviews_only=False, limit=None)
+    target_filter = _resolve_target_arg(conn, target)
+    _run_ingest_safely(
+        cfg,
+        conn,
+        since=since,
+        commits_only=False,
+        reviews_only=False,
+        limit=None,
+        target=target_filter.id if target_filter else None,
+    )
     if not skip_summarize:
         run_summarize(cfg, conn, report=_report)
     run_embed(cfg, conn, rebuild=False, batch_size=cfg.embed.batch_size, report=_report)
 
 
 @app.command()
-def stats(config: Path | None = typer.Option(None, "--config")) -> None:
-    """Show artifact / chunk / vector counts."""
+def stats(
+    target: str | None = typer.Option(
+        None, "--target", help="Restrict to one target. Default: per-target breakdown."
+    ),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """Show artifact / chunk / vector counts. Per-target breakdown by default."""
     cfg, conn = _ctx(config)
-    s = q.stats(conn)
-    target = load_target(conn)
+    targets = load_targets(conn)
 
-    if target:
-        if target.is_user:
-            console.print(
-                f"[bold]Target:[/bold] user {target.name} "
-                f"({len(target.emails)} emails) — {cfg.paths.db_path}"
-            )
-        elif target.is_repo:
-            console.print(f"[bold]Target:[/bold] repo {target.name} — {cfg.paths.db_path}")
-        else:
-            console.print(f"[bold]Target:[/bold] org {target.name} — {cfg.paths.db_path}")
-    else:
-        console.print("[yellow]No target. Run `gt init` first.[/yellow]")
+    if not targets:
+        console.print("[yellow]No targets. Run `gt init` first.[/yellow]")
+        return
 
-    t1 = Table(title="Artifacts by kind")
-    t1.add_column("kind")
-    t1.add_column("count", justify="right")
-    for k, n in sorted(s["artifacts"].items()):
-        t1.add_row(k, str(n))
-    console.print(t1)
+    if target is not None:
+        t = _resolve_target_arg(conn, target)
+        assert t is not None and t.id is not None
+        targets = [t]
 
-    t2 = Table(title="Chunks by kind")
-    t2.add_column("kind")
-    t2.add_column("count", justify="right")
-    for k, n in sorted(s["chunks"].items()):
-        t2.add_row(k, str(n))
-    console.print(t2)
+    console.print(f"[bold]DB:[/bold] {cfg.paths.db_path}")
+    for tg in targets:
+        assert tg.id is not None
+        s = q.stats(conn, target_id=tg.id)
+        console.print(
+            f"\n[bold]Target:[/bold] {tg.kind} {tg.name} "
+            f"(id {tg.id}" + (f", {len(tg.emails)} emails" if tg.is_user else "") + ")"
+        )
+        t1 = Table(title="Artifacts by kind")
+        t1.add_column("kind")
+        t1.add_column("count", justify="right")
+        for k, n in sorted(s["artifacts"].items()):
+            t1.add_row(k, str(n))
+        console.print(t1)
 
-    t3 = Table(title="Languages by chunk (top 15)")
-    t3.add_column("language")
-    t3.add_column("chunks", justify="right")
-    for lang, n in list(s["languages"].items())[:15]:
-        t3.add_row(lang or "<none>", str(n))
-    console.print(t3)
+        t2 = Table(title="Chunks by kind")
+        t2.add_column("kind")
+        t2.add_column("count", justify="right")
+        for k, n in sorted(s["chunks"].items()):
+            t2.add_row(k, str(n))
+        console.print(t2)
 
-    console.print(
-        f"[bold]vectors:[/bold] {s['vectors']}    [bold]pending embed:[/bold] {s['pending_embed']}"
-    )
+        t3 = Table(title="Languages by chunk (top 15)")
+        t3.add_column("language")
+        t3.add_column("chunks", justify="right")
+        for lang, n in list(s["languages"].items())[:15]:
+            t3.add_row(lang or "<none>", str(n))
+        console.print(t3)
+
+        console.print(
+            f"[bold]vectors:[/bold] {s['vectors']}    "
+            f"[bold]pending embed:[/bold] {s['pending_embed']}"
+        )
 
 
 @app.command()
 def repos(
+    target: str | None = typer.Option(
+        None, "--target", help="Restrict to one target's repos. Default: all."
+    ),
     include_archived: bool = typer.Option(False, "--include-archived"),
     include_forks: bool = typer.Option(False, "--include-forks"),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """List repos discovered for the current org target."""
+    """List repos in the DB. Without --target, lists across all targets."""
     _cfg, conn = _ctx(config)
-    target = load_target(conn)
-    if target is None or not target.is_org:
-        console.print(
-            "[yellow]`gt repos` is org-mode only. Run "
-            "`gt init --kind org --org <name>` first.[/yellow]"
-        )
-        raise typer.Exit(1)
-    rows = q.list_repos(conn, include_archived=include_archived, include_forks=include_forks)
+    target_filter = _resolve_target_arg(conn, target)
+    rows = q.list_repos(
+        conn,
+        target_id=target_filter.id if target_filter else None,
+        include_archived=include_archived,
+        include_forks=include_forks,
+    )
     if not rows:
-        console.print("[yellow]No repos. Re-run `gt init --kind org` to populate.[/yellow]")
+        console.print(
+            "[yellow]No repos. Run `gt init --kind org --org <name>` or "
+            "`gt init --kind repo --repo owner/name` first.[/yellow]"
+        )
         return
-    t = Table(title=f"Repos for {target.name} ({len(rows)} shown)")
+    # Build a target_id → name lookup so each row gets a human-readable owner.
+    targets_by_id = {t.id: t.name for t in load_targets(conn)}
+    title = (
+        f"Repos for {target_filter.name} ({len(rows)} shown)"
+        if target_filter
+        else f"Repos across all targets ({len(rows)} shown)"
+    )
+    t = Table(title=title)
+    t.add_column("target")
     t.add_column("full_name")
     t.add_column("default_branch")
     t.add_column("pushed_at")
@@ -737,6 +832,7 @@ def repos(
     t.add_column("fork")
     for r in rows:
         t.add_row(
+            targets_by_id.get(r["target_id"], f"#{r['target_id']}"),
             r["full_name"],
             r["default_branch"] or "",
             r["pushed_at"] or "",
@@ -752,55 +848,56 @@ def distill(
     backend: str = typer.Option(
         None,
         "--backend",
-        help="'claude' | 'gemini' | 'ollama' | unset for auto (Claude > Gemini > Ollama by key availability).",
+        help="'claude' | 'gemini' | 'ollama' | unset for auto.",
+    ),
+    target: str | None = typer.Option(
+        None, "--target", help="Target name. Required when the DB has >1 target."
     ),
     author: str | None = typer.Option(
         None,
         "--author",
-        help=(
-            "GitHub login to scope clustering to a single reviewer. "
-            "Recommended in org-mode (defaults to target.name for users)."
-        ),
+        help="GitHub login to scope clustering to a single reviewer.",
     ),
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help=(
-            "'owner/name' to scope clustering to one repo. Combines with "
-            "--author and --language. Rule artifacts get stamped with this "
-            "repo so find_applicable_rules(repo=...) surfaces them."
-        ),
+        help="'owner/name' to scope clustering to one repo.",
     ),
     kind: str = typer.Option(
         "review",
         "--kind",
-        help=(
-            "'review' (default): cluster review_comment chunks into reviewer "
-            "rules. 'code': cluster diff-added code chunks into code-pattern "
-            "rules an agent can retrieve when writing new code."
-        ),
+        help="'review' or 'code'.",
     ),
     language: str | None = typer.Option(
         None,
         "--language",
-        help=(
-            "Per-chunk language filter. Only honored for --kind code "
-            "(code patterns cluster better when scoped to one language)."
-        ),
+        help="Per-chunk language filter. Only honored for --kind code.",
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Cluster commits or review comments and synthesize reusable rules."""
+    """Cluster commits or review comments and synthesize reusable rules.
+
+    Rule artifacts are stamped with the chosen target's id, so retrieval
+    can scope rules to a specific target (or coalesce across all of them).
+    """
     cfg, conn = _ctx(config)
-    target = load_target(conn)
+    if target is not None:
+        chosen = _resolve_target_arg(conn, target)
+        assert chosen is not None and chosen.id is not None
+    else:
+        try:
+            chosen = load_target(conn)
+        except AmbiguousTargetError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from None
+        if chosen is None or chosen.id is None:
+            console.print("[red]No targets in DB. Run `gt init` first.[/red]")
+            raise typer.Exit(1)
     kind = kind.lower()
     if kind not in ("review", "code"):
         raise typer.BadParameter(f"--kind must be 'review' or 'code', got {kind!r}")
-    # User-mode default: scope to the indexed user so their own rules are
-    # clean. Explicit --author always wins. In org-mode we leave it None
-    # unless --author is supplied (no implicit scoping).
     scoped_author = author
-    if scoped_author is None and target is not None and target.is_user:
+    if scoped_author is None and chosen.is_user:
         scoped_author = None  # user-mode artifacts don't carry author_login today
     system_prompt = CODE_SYSTEM_PROMPT if kind == "code" else SYSTEM_PROMPT
     synth = make_synthesizer(
@@ -811,8 +908,6 @@ def distill(
         system_prompt=system_prompt,
     )
     embedder = make_embedder(cfg.embed)
-    # `distill_rules` declares Literal types for these — assign through
-    # explicitly-typed locals so mypy can narrow on the branch.
     chunk_kind: Literal["code", "review_comment"]
     rule_chunk_kind: Literal["rule", "code_rule"]
     if kind == "code":
@@ -824,6 +919,7 @@ def distill(
         synth=synth,
         embedder=embedder,
         cfg=cfg.distill,
+        target_id=chosen.id,
         author_login=scoped_author,
         chunk_kind=chunk_kind,
         rule_chunk_kind=rule_chunk_kind,
@@ -831,14 +927,14 @@ def distill(
         repo=repo,
         report=_report,
     )
-    scope_bits = []
+    scope_bits = [f"target={chosen.name}"]
     if scoped_author:
         scope_bits.append(f"author={scoped_author}")
     if repo:
         scope_bits.append(f"repo={repo}")
     if language and kind == "code":
         scope_bits.append(f"language={language}")
-    scope_msg = f" ({', '.join(scope_bits)})" if scope_bits else ""
+    scope_msg = f" ({', '.join(scope_bits)})"
     console.print(
         f"[green]distill --kind {kind}{scope_msg}[/green]: clusters={stats.clusters} "
         f"rules={stats.rules_written} incoherent={stats.incoherent} "
@@ -860,13 +956,13 @@ def clones_prune(
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Remove cached clones for repos no longer in the target's repo list.
+    """Remove cached clones for repos no longer referenced by any target.
 
-    Pruning is keyed on `q.list_repos` (the same set the file walk uses), so
-    anything dropped from the org or excluded by config gets GC'd next prune.
+    Keep-set is the union of `repo.full_name` across every target — a
+    clone stays as long as at least one target still references it.
     """
     cfg, conn = _ctx(config)
-    keep = {r["full_name"] for r in q.list_repos(conn, include_archived=True, include_forks=True)}
+    keep = q.all_cached_repos(conn)
     decisions = prune_cache(
         cfg.ingest.clones_dir,
         keep=keep,
@@ -890,8 +986,7 @@ def _preflight_eligibility(
     repo: str | None,
     surface: str,
 ) -> bool:
-    """Print holdout counts before launching paid LLM calls. Returns False
-    if the relevant count is zero so the caller can bail."""
+    """Print holdout counts before launching paid LLM calls."""
     counts = count_eligible(conn, since=since, author_login=author, repo=repo)
     scope_bits = [f"since={since}"]
     if author:
@@ -926,10 +1021,7 @@ def _preflight_eligibility(
 
 
 def _make_judge_embedder(cfg: Config, judge_backend: str | None) -> Embedder:
-    """Pick a *different* embedder for scoring than the one used for retrieval,
-    so the eval doesn't reduce to 'how well does the retriever cluster its own
-    outputs.' Default judge is sentence-transformers BGE if installed; fall
-    back to the retrieval embedder with a printed warning."""
+    """Pick a *different* embedder for scoring than the one used for retrieval."""
     if judge_backend == "same":
         console.print(
             "[yellow]warning: --judge-backend=same uses the retrieval embedder; "
@@ -964,25 +1056,17 @@ def eval_reviews(
     author: str | None = typer.Option(
         None,
         "--author",
-        help="GitHub login. Recommended in org-mode (scopes holdout + RAG to one reviewer).",
+        help="GitHub login.",
     ),
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="'owner/name'. Scopes both holdout and retrieval to one repo.",
+        help="'owner/name'.",
     ),
     limit: int | None = typer.Option(None, "--limit", help="Cap held-out items."),
     k: int = 5,
-    llm_backend: str | None = typer.Option(
-        None,
-        "--llm-backend",
-        help="'claude' | 'gemini' | 'ollama' | auto (default).",
-    ),
-    judge_backend: str | None = typer.Option(
-        None,
-        "--judge-backend",
-        help="Judge embedder. Default: sentence_transformers. 'same' uses retrieval embedder (biased).",
-    ),
+    llm_backend: str | None = typer.Option(None, "--llm-backend"),
+    judge_backend: str | None = typer.Option(None, "--judge-backend"),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
     """Score retrieved-context review comments against held-out ground truth."""
@@ -1032,20 +1116,8 @@ def eval_reviews(
 @eval_app.command("predictions")
 def eval_predictions(
     since: str = typer.Option(..., "--since"),
-    author: str | None = typer.Option(
-        None,
-        "--author",
-        help=(
-            "GitHub login. Required in org-mode (`artifact.decision` is NULL "
-            "there; truth lives in meta.reviewer_decisions). Without it, "
-            "org-mode runs return n=0."
-        ),
-    ),
-    repo: str | None = typer.Option(
-        None,
-        "--repo",
-        help="'owner/name'. Scopes both holdout and retrieval to one repo.",
-    ),
+    author: str | None = typer.Option(None, "--author"),
+    repo: str | None = typer.Option(None, "--repo"),
     limit: int | None = typer.Option(None, "--limit"),
     k: int = 20,
     llm_backend: str | None = typer.Option(None, "--llm-backend"),
@@ -1097,21 +1169,16 @@ def eval_search(
     mode: str = typer.Option(
         "all",
         "--mode",
-        help="bm25 | vector | hybrid | all (default: all three, comma-separated also accepted).",
+        help="bm25 | vector | hybrid | all (default).",
     ),
     expansion: str | None = typer.Option(
         None,
         "--expansion",
-        help="Override cfg.retrieval.query_expansion: off | rule | ollama. "
-        "Useful for A/B comparing the BM25 expander on this corpus.",
+        help="Override cfg.retrieval.query_expansion: off | rule | ollama.",
     ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Retrieval-quality eval: per-tier x per-backend pass rates against a query bank.
-
-    Tier 1 must hit 100% — any miss exits non-zero so this can gate CI.
-    Tier 2/3 misses warn but pass.
-    """
+    """Retrieval-quality eval."""
     cfg, conn = _ctx(config)
     if mode == "all":
         modes = ALL_MODES
