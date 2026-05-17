@@ -67,6 +67,16 @@ class RetrievalCfg(BaseModel):
     ollama_host: str = "http://127.0.0.1:11434"
     # Cache path is resolved against `paths.data_dir` when None.
     expansion_cache_path: Path | None = None
+    # Exponential half-life (in days) for recency-weighted re-ranking inside
+    # `hybrid_search`. None / 0 = off (current behavior). When set, the
+    # fused RRF score of each candidate is multiplied by
+    # `0.5 ** (age_days / half_life_days)` before the final top-k slice.
+    # Decay applies only to style-bearing artifact kinds (commit, pr,
+    # review_comment, issue_comment); file-at-HEAD and synthesized rule
+    # artifacts are left untouched. `predict_review_outcome` bypasses
+    # hybrid_search and is unaffected by design (its inverse-distance vote
+    # weighting is calibrated on raw L2).
+    recency_half_life_days: float | None = None
 
 
 class EmbedCfg(BaseModel):
