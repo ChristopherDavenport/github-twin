@@ -5,6 +5,7 @@ vector and BM25 disagree, then assert the fused ranking matches the RRF
 formula `1/(60 + rank + 1)` exactly.
 """
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -278,3 +279,214 @@ def test_hybrid_respects_filters(conn):
         k=5,
     )
     assert [h.chunk_id for h in hits] == [cid_py]
+
+
+# ---------- recency decay ----------
+
+
+def _seed_with_age(
+    conn, *, text: str, vec: list[float], created_at: str | None, artifact_kind: str = "commit"
+) -> int:
+    """Like _seed, but lets the test pin the artifact's created_at and kind.
+
+    `commit` is the default kind so the chunk participates in decay; pass
+    `file` to verify the kind-exclusion path.
+    """
+    aid = q.upsert_artifact(
+        conn,
+        target_id=1,
+        kind=artifact_kind,
+        external_id=f"age-{text}-{created_at}-{artifact_kind}",
+        source_url=None,
+        repo="me/x",
+        language="python",
+        author_email=None,
+        author_login=None,
+        created_at=created_at,
+        decision=None,
+        meta=None,
+    )
+    chunk_kind = "file" if artifact_kind == "file" else "code"
+    cid = q.insert_chunk(
+        conn,
+        artifact_id=aid,
+        kind=chunk_kind,
+        text=text,
+        context={"language": "python"},
+        language="python",
+    )
+    q.write_embedding(conn, chunk_id=cid, embedding=vec, model_id="fake")
+    return cid
+
+
+def test_hybrid_recency_reranks_old_below_new(conn):
+    """Two chunks with identical RRF input — the older one drops below
+    the newer once decay is applied with a meaningful half-life."""
+    ref = datetime(2026, 5, 16, tzinfo=UTC)
+    old_ts = (ref - timedelta(days=730)).isoformat()  # ~2 years
+    new_ts = (ref - timedelta(days=1)).isoformat()  # yesterday
+
+    # Both contain the same keyword (BM25 tie) and both embed to pattern A
+    # (vector tie). Their only differentiator is created_at.
+    old_id = _seed_with_age(conn, text="A shared_word old", vec=[1.0, 0, 0, 0], created_at=old_ts)
+    new_id = _seed_with_age(conn, text="A shared_word new", vec=[1.0, 0, 0, 0], created_at=new_ts)
+
+    store = SqliteVecStore(conn)
+    embedder = FakeEmbedder()
+    qvec = embedder.embed(["A query"])[0]
+
+    # Baseline (no decay): both surface; ordering is determined by FTS5 /
+    # vector tie-break order, not by age.
+    baseline = hybrid_search(
+        store,
+        conn,
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="code"),
+        k=5,
+        now=ref,
+    )
+    baseline_ids = {h.chunk_id for h in baseline}
+    assert {old_id, new_id} <= baseline_ids
+
+    # With a 1-year half-life: weight(old)=0.5**2=0.25, weight(new)≈1.0.
+    decayed = hybrid_search(
+        store,
+        conn,
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="code"),
+        k=5,
+        recency_half_life_days=365.0,
+        now=ref,
+    )
+    ids = [h.chunk_id for h in decayed]
+    assert ids.index(new_id) < ids.index(old_id)
+
+
+def test_hybrid_recency_skips_file_kind(conn):
+    """File-at-HEAD chunks (artifact.kind='file') are excluded from decay
+    so an ancient file-snapshot keeps its original rank even with a tiny
+    half-life that would otherwise crush it."""
+    ref = datetime(2026, 5, 16, tzinfo=UTC)
+    ancient = (ref - timedelta(days=3650)).isoformat()  # 10 years
+    new_ts = (ref - timedelta(days=1)).isoformat()
+
+    # `file` chunks live in chunk_kind='file'; we need the filter to match.
+    file_old = _seed_with_age(
+        conn,
+        text="A shared_word ancient_file",
+        vec=[1.0, 0, 0, 0],
+        created_at=ancient,
+        artifact_kind="file",
+    )
+    file_new = _seed_with_age(
+        conn,
+        text="A shared_word recent_file",
+        vec=[0.99, 0.01, 0, 0],
+        created_at=new_ts,
+        artifact_kind="file",
+    )
+
+    store = SqliteVecStore(conn)
+    embedder = FakeEmbedder()
+    qvec = embedder.embed(["A query"])[0]
+
+    # Capture order without decay…
+    baseline = hybrid_search(
+        store,
+        conn,
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="file"),
+        k=5,
+        now=ref,
+    )
+    baseline_ids = [h.chunk_id for h in baseline]
+
+    # …and verify a 30-day half-life leaves it intact (no decay applied
+    # because artifact.kind='file' is excluded).
+    decayed = hybrid_search(
+        store,
+        conn,
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="file"),
+        k=5,
+        recency_half_life_days=30.0,
+        now=ref,
+    )
+    assert [h.chunk_id for h in decayed] == baseline_ids
+    assert {file_old, file_new} <= set(baseline_ids)
+
+
+def test_hybrid_recency_missing_created_at_is_no_penalty(conn):
+    """A chunk whose artifact has NULL created_at must not be silently
+    penalized — current policy treats undatable chunks as weight=1.0."""
+    ref = datetime(2026, 5, 16, tzinfo=UTC)
+    old_ts = (ref - timedelta(days=3650)).isoformat()
+
+    no_date = _seed_with_age(
+        conn, text="A shared_word undated", vec=[1.0, 0, 0, 0], created_at=None
+    )
+    old_id = _seed_with_age(
+        conn, text="A shared_word ancient", vec=[1.0, 0, 0, 0], created_at=old_ts
+    )
+
+    store = SqliteVecStore(conn)
+    embedder = FakeEmbedder()
+    qvec = embedder.embed(["A query"])[0]
+
+    hits = hybrid_search(
+        store,
+        conn,
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="code"),
+        k=5,
+        recency_half_life_days=365.0,
+        now=ref,
+    )
+    ids = [h.chunk_id for h in hits]
+    # The undated chunk should outrank the 10-year-old chunk (weight 1.0
+    # vs. 0.5**10 ≈ 0.001).
+    assert ids.index(no_date) < ids.index(old_id)
+
+
+def test_hybrid_recency_none_is_identical_to_omitting(conn):
+    """Passing `recency_half_life_days=None` must produce the same hits +
+    distances as omitting the parameter entirely (defensive: bit-identical
+    no-op when off)."""
+    ref = datetime(2026, 5, 16, tzinfo=UTC)
+    _seed_with_age(
+        conn,
+        text="A shared_word a",
+        vec=[1.0, 0, 0, 0],
+        created_at=(ref - timedelta(days=100)).isoformat(),
+    )
+    _seed_with_age(
+        conn,
+        text="A shared_word b",
+        vec=[0.99, 0.01, 0, 0],
+        created_at=(ref - timedelta(days=1000)).isoformat(),
+    )
+
+    store = SqliteVecStore(conn)
+    embedder = FakeEmbedder()
+    qvec = embedder.embed(["A query"])[0]
+    common = dict(
+        query_vec=qvec,
+        query_text="shared_word",
+        filters=VectorSearchFilters(chunk_kind="code"),
+        k=5,
+    )
+    omitted = hybrid_search(store, conn, **common)
+    passed_none = hybrid_search(store, conn, recency_half_life_days=None, **common)
+    zero = hybrid_search(store, conn, recency_half_life_days=0, **common)
+
+    def _shape(hs):
+        return [(h.chunk_id, round(h.distance, 9)) for h in hs]
+
+    assert _shape(omitted) == _shape(passed_none)
+    # Zero / negative is also treated as off (avoids divide-by-zero).
+    assert _shape(omitted) == _shape(zero)
