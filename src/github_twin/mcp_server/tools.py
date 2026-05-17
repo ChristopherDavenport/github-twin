@@ -2,6 +2,20 @@
 
 Keeping these separate from server.py means unit tests can exercise the
 retrieval logic directly without spinning up an MCP transport.
+
+Multi-target semantics:
+
+- Every tool that filters by target accepts an optional `target` (target
+  name). When unset, queries coalesce across every target in the DB and
+  the SQL layer dedupes on `(artifact.kind, artifact.external_id,
+  chunk_idx)` so a commit that exists under multiple targets contributes
+  one hit.
+- `_resolve_scope` translates `scope="personal"` to the unique user-mode
+  target (sets both `target_id` and `author_login`) and `scope="project"`
+  to the unique repo-mode target. Each narrowed lookup avoids the
+  coalesce dedup since single-target reads are already unique.
+- Returned hits carry `target_name` so callers can see which target a
+  result came from in coalesced mode.
 """
 
 from __future__ import annotations
@@ -18,7 +32,7 @@ from github_twin.observability import set_safe_attributes, tracer
 from github_twin.store import queries as q
 from github_twin.store.query_expansion import QueryExpander
 from github_twin.store.vector_store import VectorSearchFilters, VectorStore, hybrid_search
-from github_twin.target import load_target
+from github_twin.target import AmbiguousTargetError, load_target
 
 Scope = Literal["all", "personal", "project"]
 
@@ -36,8 +50,7 @@ def _truncate(text: str, max_lines: int) -> str:
 
 def _embed_one(embedder: Embedder, text: str) -> list[float]:
     """Run the embedder under a span so the OTel trace shows embed
-    latency separately from retrieval latency. The span is a noop
-    when no OTel SDK is configured (the API ships a free noop tracer)."""
+    latency separately from retrieval latency."""
     with tracer().start_as_current_span("embedder.embed") as span:
         set_safe_attributes(
             span,
@@ -59,15 +72,15 @@ def _hybrid(
     k: int,
     expander: QueryExpander | None,
 ) -> list[q.SearchHit]:
-    """`hybrid_search` wrapped in a span that records the result count
-    and top distance — the two attributes most useful for retrieving
-    a query later in the trace UI."""
+    """`hybrid_search` wrapped in a span that records result count and
+    top distance."""
     with tracer().start_as_current_span("retrieval.hybrid_search") as span:
         set_safe_attributes(
             span,
             **{
                 "gh_twin.retrieval.chunk_kind": filters.chunk_kind,
                 "gh_twin.retrieval.k": k,
+                "gh_twin.retrieval.target_id": filters.target_id,
                 "gh_twin.retrieval.expander": (
                     expander.backend_id if expander is not None else "off"
                 ),
@@ -97,19 +110,23 @@ def find_review_comments(
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
+    target: str | None = None,
     scope: Scope = "all",
     k: int = 5,
     expander: QueryExpander | None = None,
 ) -> list[dict[str, Any]]:
     """Return up to k past review comments on diffs that look like `diff_hunk`.
 
-    `scope` is sugar over `repo` / `author_login`: `"personal"` fills
-    `author_login` from the user-mode target, `"project"` fills `repo`
-    from a repo-mode target. Explicit kwargs always win over scope.
+    `target` narrows to one target by name; without it the search coalesces
+    across every target with cross-target dedup. `scope="personal"` resolves
+    to the unique user-mode target; `scope="project"` to the unique repo-mode
+    target. Explicit kwargs always win over scope.
     """
     if not diff_hunk.strip():
         return []
-    repo, author_login = _resolve_scope(conn, scope=scope, repo=repo, author_login=author_login)
+    target_id, repo, author_login = _resolve_scope(
+        conn, scope=scope, target=target, repo=repo, author_login=author_login
+    )
     vec = _embed_one(embedder, diff_hunk)
     hits = _hybrid(
         store,
@@ -121,6 +138,7 @@ def find_review_comments(
             language=language,
             repo=repo,
             author_login=author_login,
+            target_id=target_id,
         ),
         k=k,
         expander=expander,
@@ -138,6 +156,7 @@ def find_review_comments(
                 "language": ctx.get("language") or h.artifact_language,
                 "pr_title": ctx.get("pr_title"),
                 "repo": h.artifact_repo,
+                "target": h.target_name,
                 "url": ctx.get("url") or h.artifact_source_url,
                 "distance": round(h.distance, 4),
             }
@@ -149,10 +168,16 @@ def summarize_review_patterns(
     conn: sqlite3.Connection,
     *,
     language: str | None = None,
+    target: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Return distilled review rules and the comment quotes that motivated them."""
-    return q.list_rules(conn, language=language, limit=limit)
+    """Return distilled review rules and the comment quotes that motivated them.
+
+    `target` narrows to one target's rules; without it returns rules
+    coalesced across every target.
+    """
+    target_id = _lookup_target_id(conn, target)
+    return q.list_rules(conn, language=language, limit=limit, target_id=target_id)
 
 
 def find_style_examples(
@@ -164,16 +189,18 @@ def find_style_examples(
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
+    target: str | None = None,
     scope: Scope = "all",
     k: int = 5,
     expander: QueryExpander | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k code chunks matching `query`. In user mode, all rows are
-    yours; in org mode, narrow with `author_login=...` or `scope="personal"`
-    to scope to one person."""
+    """Return up to k code chunks matching `query`. Multi-target aware:
+    `target` narrows to one target; unset coalesces across all."""
     if not query.strip():
         return []
-    repo, author_login = _resolve_scope(conn, scope=scope, repo=repo, author_login=author_login)
+    target_id, repo, author_login = _resolve_scope(
+        conn, scope=scope, target=target, repo=repo, author_login=author_login
+    )
     vec = _embed_one(embedder, query)
     hits = _hybrid(
         store,
@@ -185,6 +212,7 @@ def find_style_examples(
             language=language,
             repo=repo,
             author_login=author_login,
+            target_id=target_id,
         ),
         k=k,
         expander=expander,
@@ -198,6 +226,7 @@ def find_style_examples(
                 "language": ctx.get("language") or h.artifact_language,
                 "path": ctx.get("path"),
                 "repo": h.artifact_repo,
+                "target": h.target_name,
                 "commit_url": ctx.get("source_url") or h.artifact_source_url,
                 "distance": round(h.distance, 4),
             }
@@ -219,13 +248,7 @@ def _fetch_pr_metas(conn: sqlite3.Connection, artifact_ids: list[int]) -> dict[i
 def _decision_for_hit(
     hit: q.SearchHit, meta: dict[str, Any], author_login: str | None
 ) -> str | None:
-    """Pick the relevant decision for one PR hit.
-
-    - If `author_login` is supplied, take that author's entry from
-      `meta.reviewer_decisions` (org-mode shape).
-    - Otherwise prefer the artifact-level `decision` column (user-mode).
-    - Returns None if neither path yields a usable decision.
-    """
+    """Pick the relevant decision for one PR hit."""
     if author_login is not None:
         for entry in meta.get("reviewer_decisions", []) or []:
             if entry.get("login") == author_login:
@@ -247,20 +270,20 @@ def predict_review_outcome(
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
+    target: str | None = None,
     k: int = 20,
 ) -> dict[str, Any]:
-    """Predict how a candidate PR would be reviewed, based on similar past PRs.
+    """Predict how a candidate PR would be reviewed.
 
-    Embeds `diff_or_summary` (a diff, a PR title+body, or a free-form
-    description) and pulls the nearest `kind='pr_summary'` chunks. Each
-    PR's decision is weighted by inverse distance (closer = more votes).
-    Set `author_login` to scope to one reviewer's history (org-mode).
+    Intentionally bypasses `hybrid_search` and uses `store.search`
+    directly: the inverse-distance weighting below is calibrated on
+    raw L2 distance, and RRF's `1 - rrf_score` would silently change
+    the prediction math.
 
-    Intentionally bypasses `hybrid_search` and goes straight to
-    `store.search`: the inverse-distance weighting below is calibrated on
-    raw L2 distance, and RRF's `1 - rrf_score` would silently change the
-    prediction math.
+    `target` narrows to one target's PRs; without it coalesces with
+    dedup (so a PR ingested under multiple targets contributes one vote).
     """
+    target_id = _lookup_target_id(conn, target)
     empty = {
         "prediction": "unknown",
         "confidence": 0.0,
@@ -278,11 +301,17 @@ def predict_review_outcome(
             **{
                 "gh_twin.retrieval.chunk_kind": "pr_summary",
                 "gh_twin.retrieval.k": k,
+                "gh_twin.retrieval.target_id": target_id,
             },
         )
         hits = store.search(
             vec,
-            filters=VectorSearchFilters(chunk_kind="pr_summary", language=language, repo=repo),
+            filters=VectorSearchFilters(
+                chunk_kind="pr_summary",
+                language=language,
+                repo=repo,
+                target_id=target_id,
+            ),
             k=k,
         )
         span.set_attribute("gh_twin.retrieval.hits", len(hits))
@@ -308,6 +337,7 @@ def predict_review_outcome(
                 "url": h.artifact_source_url,
                 "title": ctx.get("pr_title") or meta.get("title"),
                 "repo": h.artifact_repo,
+                "target": h.target_name,
                 "distance": round(h.distance, 4),
                 "decision": decision,
             }
@@ -335,22 +365,14 @@ def find_applicable_rules(
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
+    target: str | None = None,
     k: int = 5,
     expander: QueryExpander | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k distilled code-pattern rules most relevant to `query`.
-
-    Code rules are produced by `gt distill --kind code` (clustering of
-    `chunk.kind='code'` blocks plus LLM synthesis). They're stored as
-    `chunk.kind='code_rule'` and embedded the same way every other chunk
-    is, so retrieval is identical to `find_review_comments`.
-
-    Use this when an agent is about to write code and wants to mirror
-    established patterns. Scope to `author_login` for personal style,
-    `repo` for project style, or leave both unscoped for org-wide style.
-    """
+    """Return up to k distilled code-pattern rules most relevant to `query`."""
     if not query.strip():
         return []
+    target_id = _lookup_target_id(conn, target)
     vec = _embed_one(embedder, query)
     hits = _hybrid(
         store,
@@ -362,6 +384,7 @@ def find_applicable_rules(
             language=language,
             repo=repo,
             author_login=author_login,
+            target_id=target_id,
         ),
         k=k,
         expander=expander,
@@ -374,6 +397,7 @@ def find_applicable_rules(
                 "rule": h.text,
                 "language": ctx.get("language") or h.artifact_language,
                 "examples": ctx.get("examples", []),
+                "target": h.target_name,
                 "distance": round(h.distance, 4),
             }
         )
@@ -390,23 +414,16 @@ def find_code(
     repo: str | None = None,
     path_glob: str | None = None,
     node_kind: str | None = None,
+    target: str | None = None,
     k: int = 5,
     expander: QueryExpander | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k file-at-HEAD snippets matching `query` (org-mode).
-
-    `repo` pre-filters at SQL. `path_glob` post-filters in Python so we
-    don't have to teach SQL fnmatch — overscan slightly to compensate.
-    `node_kind` filters on the tree-sitter AST node type (e.g.
-    "function_definition", "class_definition"); only applies to chunks
-    produced by the AST chunker — line-window fallback chunks have
-    `node_kind = NULL` and won't match.
-    """
+    """Return up to k file-at-HEAD snippets matching `query`."""
     if not query.strip():
         return []
+    target_id = _lookup_target_id(conn, target)
     vec = _embed_one(embedder, query)
-    # Overscan when we'll post-filter by path glob, so the final result set
-    # still has a decent shot at hitting k.
+    # Overscan when we'll post-filter by path glob.
     sql_k = k * 4 if path_glob else k
     hits = _hybrid(
         store,
@@ -418,6 +435,7 @@ def find_code(
             language=language,
             repo=repo,
             node_kind=node_kind,
+            target_id=target_id,
         ),
         k=sql_k,
         expander=expander,
@@ -438,6 +456,7 @@ def find_code(
                 "node_kind": ctx.get("node_kind"),
                 "symbol_name": ctx.get("symbol_name"),
                 "repo": h.artifact_repo,
+                "target": h.target_name,
                 "url": ctx.get("source_url") or h.artifact_source_url,
                 "distance": round(h.distance, 4),
             }
@@ -450,34 +469,60 @@ def find_code(
 # ---------- Prompt-management surface (house_rules, developer_profile, scope) ----------
 
 
+def _lookup_target_id(conn: sqlite3.Connection, target: str | None) -> int | None:
+    """Translate a `target=NAME` parameter to an id. None means coalesce."""
+    if target is None:
+        return None
+    t = load_target(conn, name=target)
+    if t is None or t.id is None:
+        raise ValueError(f"No target named {target!r} in this DB.")
+    return t.id
+
+
 def _resolve_scope(
     conn: sqlite3.Connection,
     *,
     scope: Scope,
+    target: str | None,
     repo: str | None,
     author_login: str | None,
-) -> tuple[str | None, str | None]:
-    """Translate a named scope into concrete `(repo, author_login)`
-    filters that `hybrid_search` already understands. Explicit
-    `repo=` / `author_login=` kwargs always win — scope only fills
-    fields the caller left unset.
+) -> tuple[int | None, str | None, str | None]:
+    """Translate scope + target into `(target_id, repo, author_login)`.
 
-    - `scope="personal"` defaults `author_login` to the target's name
-      when the target is a single user; in org-mode the caller must
-      pass `author_login=` explicitly.
-    - `scope="project"` defaults `repo` to the target's name when the
-      target is `kind='repo'`; in org-mode the caller picks one.
+    - `scope="personal"` resolves the unique user-mode target and fills
+      both `target_id` (so coalesce-mode dedup doesn't reintroduce org-side
+      copies of the user's own commits) and `author_login` (sugar over the
+      author_login column).
+    - `scope="project"` resolves the unique repo-mode target and fills
+      `target_id` + `repo`.
     - `scope="all"` is a no-op pass-through.
+    - Explicit `target` always wins; explicit `repo` / `author_login`
+      kwargs win within their dimension.
     """
+    target_id = _lookup_target_id(conn, target)
     if scope == "all":
-        return repo, author_login
-
-    target = load_target(conn)
-    if scope == "personal" and author_login is None and target is not None and target.is_user:
-        author_login = target.name
-    elif scope == "project" and repo is None and target is not None and target.is_repo:
-        repo = target.name
-    return repo, author_login
+        return target_id, repo, author_login
+    if scope == "personal":
+        try:
+            t = load_target(conn, kind="user")
+        except AmbiguousTargetError as exc:
+            raise ValueError(f"scope='personal' is ambiguous: {exc}") from None
+        if t is not None and t.id is not None:
+            if target_id is None:
+                target_id = t.id
+            if author_login is None:
+                author_login = t.name
+    elif scope == "project":
+        try:
+            t = load_target(conn, kind="repo")
+        except AmbiguousTargetError as exc:
+            raise ValueError(f"scope='project' is ambiguous: {exc}") from None
+        if t is not None and t.id is not None:
+            if target_id is None:
+                target_id = t.id
+            if repo is None:
+                repo = t.name
+    return target_id, repo, author_login
 
 
 def _render_house_rules(
@@ -485,8 +530,7 @@ def _render_house_rules(
     code_rules: list[dict[str, Any]],
 ) -> str:
     """Render two `list_rules` outputs as one Markdown block, grouped
-    by language and section. Designed to be pasted directly into an
-    agent's system prompt or a `CLAUDE.md` memory file."""
+    by language and section."""
 
     def by_language(rules: list[dict[str, Any]]) -> dict[str | None, list[dict[str, Any]]]:
         out: dict[str | None, list[dict[str, Any]]] = {}
@@ -499,7 +543,6 @@ def _render_house_rules(
             return ""
         lines = [f"## {title} ({len(rules)} rules)\n"]
         grouped = by_language(rules)
-        # Sort languages stably: named first (alphabetical), unknown last.
         named = sorted(k for k in grouped if k)
         unknown = [k for k in grouped if not k]
         for lang in named + unknown:
@@ -510,10 +553,8 @@ def _render_house_rules(
                 rule_text = (r.get("rule") or "").strip()
                 if not rule_text:
                     continue
-                # `cluster_size` is the number of source comments / commits.
                 size = r.get("cluster_size") or 0
                 lines.append(f"- **{rule_text}**" + (f" (from {size} examples)" if size else ""))
-                # First example quote as evidence; trim aggressively.
                 examples = r.get("examples") or []
                 if examples:
                     quote = str(examples[0]).strip().replace("\n", " ")
@@ -548,29 +589,21 @@ def house_rules(
     language: str | None = None,
     repo: str | None = None,
     author_login: str | None = None,
+    target: str | None = None,
     scope: Scope = "all",
     limit: int = 50,
 ) -> dict[str, Any]:
     """Return all distilled rules as one Markdown block.
 
-    Two underlying calls:
-      - `list_rules(chunk_kind='rule')`      → reviewer conventions
-      - `list_rules(chunk_kind='code_rule')` → code patterns
-
-    Output is shaped for direct paste into a system prompt: one
-    Markdown section per source kind, language-bucketed within each,
-    each rule with a one-line summary plus the first example quote
-    and a source URL when available.
-
-    `language` is the high-leverage filter — without it the block
-    mixes idioms across every language the corpus touches, which is
-    actively misleading inside a single-language session. `repo`,
-    `author_login`, and `scope` mirror the retrieval tools so the
-    static surface answers the same scope vocabulary.
+    Without `target`, rules coalesce across every target with dedup; with
+    `target=NAME`, rules are restricted to that target.
     """
-    repo, author_login = _resolve_scope(conn, scope=scope, repo=repo, author_login=author_login)
+    target_id, repo, author_login = _resolve_scope(
+        conn, scope=scope, target=target, repo=repo, author_login=author_login
+    )
     review_rules = q.list_rules(
         conn,
+        target_id=target_id,
         language=language,
         repo=repo,
         author_login=author_login,
@@ -579,6 +612,7 @@ def house_rules(
     )
     code_rules = q.list_rules(
         conn,
+        target_id=target_id,
         language=language,
         repo=repo,
         author_login=author_login,
@@ -593,11 +627,8 @@ def house_rules(
     }
 
 
-# Sentinel login used when caching the user-mode default profile (no
-# explicit author_login passed). `load_target(conn)["name"]` is the
-# correct value for user-mode but doing the cache key on the literal
-# argument keeps the cache logic simple — and in user mode the corpus
-# IS the target's history.
+# Sentinel base used when caching the user-mode default profile (no
+# explicit author_login passed).
 _DEFAULT_PROFILE_LOGIN = "__target__"
 
 
@@ -606,20 +637,21 @@ def _profile_cache_key(
     author_login: str | None,
     language: str | None,
     repo: str | None,
+    target_id: int | None = None,
 ) -> str:
-    """Build a stable cache key over the (author, language, repo)
-    filter tuple. When all filters are None the key is the bare
-    `_DEFAULT_PROFILE_LOGIN` sentinel — preserves existing cache
-    entries written before scope filters existed. Any non-None
-    filter expands to a `key=value`-joined suffix."""
+    """Build a stable cache key over the (author, language, repo, target)
+    filter tuple. Each non-None dimension expands to a `key=value`-joined
+    suffix so a narrowed profile doesn't collide with an unscoped one."""
     base = author_login or _DEFAULT_PROFILE_LOGIN
-    if language is None and repo is None:
+    if language is None and repo is None and target_id is None:
         return base
     bits = []
     if language is not None:
         bits.append(f"lang={language}")
     if repo is not None:
         bits.append(f"repo={repo}")
+    if target_id is not None:
+        bits.append(f"target={target_id}")
     return base + "|" + "|".join(bits)
 
 
@@ -630,6 +662,7 @@ def developer_profile(
     author_login: str | None = None,
     language: str | None = None,
     repo: str | None = None,
+    target: str | None = None,
     scope: Scope = "all",
     n_samples: int = 50,
     max_tokens: int = 600,
@@ -637,31 +670,29 @@ def developer_profile(
 ) -> dict[str, Any]:
     """Synthesize a 2–3 paragraph voice/style profile for one author.
 
-    Pulls the N most-recent review comments from the corpus (filtered
-    by `author_login` / `repo` / `language` when supplied), hashes
-    their chunk-ids, and checks `developer_profile_cache`. On a hash
-    match the cached Markdown is returned with `from_cache=True`. On
-    miss (or `force_refresh=True`) the synthesizer is invoked and the
-    new profile is cached.
-
-    The cache key folds in all filter dimensions, so scoping to a
-    different language or repo produces (and caches) a distinct
-    profile rather than clobbering the unscoped one.
-
-    `n_samples` defaults to 50 — a balance between giving the LLM
-    enough range to characterize the author and keeping the prompt
-    under any backend's context cap (each comment is truncated to
-    ~600 chars in `distill/profile.py`).
+    Without `target`, samples coalesce across every target the author
+    appears in (with dedup); with `target=NAME`, narrows to that target's
+    history only. `scope="personal"` is the right call when you want
+    "my own user-mode corpus" specifically — it narrows to the user-mode
+    target so org-side mirrors of the same commits don't enter the sample.
     """
-    repo, author_login = _resolve_scope(conn, scope=scope, repo=repo, author_login=author_login)
+    target_id, repo, author_login = _resolve_scope(
+        conn, scope=scope, target=target, repo=repo, author_login=author_login
+    )
     comments = q.recent_review_comments(
         conn,
         author_login=author_login,
         repo=repo,
         language=language,
+        target_id=target_id,
         limit=n_samples,
     )
-    cache_key = _profile_cache_key(author_login=author_login, language=language, repo=repo)
+    cache_key = _profile_cache_key(
+        author_login=author_login,
+        language=language,
+        repo=repo,
+        target_id=target_id,
+    )
 
     if not comments:
         return {
@@ -672,6 +703,7 @@ def developer_profile(
             "author_login": author_login,
             "language": language,
             "repo": repo,
+            "target_id": target_id,
         }
 
     current_hash = sample_hash(comments)
@@ -686,6 +718,7 @@ def developer_profile(
                 "author_login": author_login,
                 "language": language,
                 "repo": repo,
+                "target_id": target_id,
             }
 
     profile_md = synthesize_profile(llm, comments, max_tokens=max_tokens)
@@ -706,4 +739,5 @@ def developer_profile(
         "author_login": author_login,
         "language": language,
         "repo": repo,
+        "target_id": target_id,
     }

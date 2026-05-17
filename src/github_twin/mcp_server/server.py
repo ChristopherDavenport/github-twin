@@ -99,6 +99,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         language: str | None = None,
         repo: str | None = None,
         author_login: str | None = None,
+        target: str | None = None,
         scope: Scope = "all",
         k: int = 5,
     ) -> list[dict[str, Any]]:
@@ -109,9 +110,11 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             language: Optional language filter (e.g. 'python', 'go', 'typescript').
             repo: Optional 'owner/name' filter (org-mode).
             author_login: Optional GH login to narrow to a single reviewer.
-            scope: Memdir-style tier hint: 'personal' fills author_login from
-                the user-mode target; 'project' fills repo from a repo-mode
-                target; 'all' (default) is unscoped. Explicit kwargs win.
+            target: Optional target name. Unset = search across every target
+                (coalesce + dedup). Each returned hit carries its target.
+            scope: 'personal' resolves to the unique user-mode target;
+                'project' to the unique repo-mode target; 'all' (default)
+                is unscoped. Explicit kwargs win.
             k: Max results to return.
         """
         with tracer().start_as_current_span("mcp.tool.find_review_comments") as span:
@@ -120,6 +123,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 **{
                     "gh_twin.tool.k": k,
                     "gh_twin.tool.scope": scope,
+                    "gh_twin.tool.target": target,
                     "gh_twin.tool.diff_hunk_chars": len(diff_hunk or ""),
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
@@ -134,6 +138,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 language=language,
                 repo=repo,
                 author_login=author_login,
+                target=target,
                 scope=scope,
                 k=k,
                 expander=expander,
@@ -147,6 +152,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         language: str | None = None,
         repo: str | None = None,
         author_login: str | None = None,
+        target: str | None = None,
         scope: Scope = "all",
         k: int = 5,
     ) -> list[dict[str, Any]]:
@@ -155,11 +161,10 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         Args:
             query: Natural-language description of what you're trying to write.
             language: Optional language filter.
-            repo: Optional 'owner/name' filter (org-mode).
-            author_login: Optional GH login to scope to one author (org-mode).
-            scope: Memdir-style tier hint: 'personal' fills author_login from
-                the user-mode target; 'project' fills repo from a repo-mode
-                target; 'all' (default) is unscoped. Explicit kwargs win.
+            repo: Optional 'owner/name' filter.
+            author_login: Optional GH login to scope to one author.
+            target: Optional target name. Unset = coalesce across every target.
+            scope: 'personal' / 'project' / 'all' — see find_review_comments.
             k: Max results to return.
         """
         with tracer().start_as_current_span("mcp.tool.find_style_examples") as span:
@@ -168,6 +173,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 **{
                     "gh_twin.tool.k": k,
                     "gh_twin.tool.scope": scope,
+                    "gh_twin.tool.target": target,
                     "gh_twin.tool.query_chars": len(query or ""),
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
@@ -182,6 +188,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 language=language,
                 repo=repo,
                 author_login=author_login,
+                target=target,
                 scope=scope,
                 k=k,
                 expander=expander,
@@ -196,19 +203,19 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         repo: str | None = None,
         path_glob: str | None = None,
         node_kind: str | None = None,
+        target: str | None = None,
         k: int = 5,
     ) -> list[dict[str, Any]]:
-        """Find source snippets at HEAD across the indexed org.
+        """Find source snippets at HEAD across every indexed target.
 
         Args:
             query: Natural-language description or code-shape to match.
             language: Optional language filter (e.g. 'scala', 'go').
             repo: Optional 'owner/name' filter.
-            path_glob: Optional fnmatch glob applied to file path
-                (e.g. '**/core/src/main/**').
-            node_kind: Optional tree-sitter AST node type to restrict
-                results to (e.g. 'function_definition', 'class_definition').
-                Only matches chunks produced by the AST chunker.
+            path_glob: Optional fnmatch glob applied to file path.
+            node_kind: Optional tree-sitter AST node type.
+            target: Optional target name. Unset = coalesce across all
+                targets with cross-target dedup. Each hit carries its target.
             k: Max results to return.
         """
         with tracer().start_as_current_span("mcp.tool.find_code") as span:
@@ -216,6 +223,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 span,
                 **{
                     "gh_twin.tool.k": k,
+                    "gh_twin.tool.target": target,
                     "gh_twin.tool.query_chars": len(query or ""),
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
@@ -232,6 +240,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 repo=repo,
                 path_glob=path_glob,
                 node_kind=node_kind,
+                target=target,
                 k=k,
                 expander=expander,
             )
@@ -244,19 +253,17 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         language: str | None = None,
         repo: str | None = None,
         author_login: str | None = None,
+        target: str | None = None,
         k: int = 5,
     ) -> list[dict[str, Any]]:
         """Find distilled code-pattern rules that apply to a coding task.
 
-        Run `gt distill --kind code` first to populate. Each rule is a
-        one-sentence pattern synthesized from a cluster of past commits.
-
         Args:
-            query: What you're about to write or change ("adding a Pydantic
-                config class", "wrapping an httpx call with retry").
-            language: Optional language filter (e.g. 'python', 'go').
-            repo: Optional 'owner/name' filter (org-mode).
+            query: What you're about to write or change.
+            language: Optional language filter.
+            repo: Optional 'owner/name' filter.
             author_login: Optional GH login to scope to personal style.
+            target: Optional target name. Unset = coalesce across all targets.
             k: Max results to return.
         """
         with tracer().start_as_current_span("mcp.tool.find_applicable_rules") as span:
@@ -264,6 +271,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 span,
                 **{
                     "gh_twin.tool.k": k,
+                    "gh_twin.tool.target": target,
                     "gh_twin.tool.query_chars": len(query or ""),
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
@@ -278,6 +286,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 language=language,
                 repo=repo,
                 author_login=author_login,
+                target=target,
                 k=k,
                 expander=expander,
             )
@@ -290,22 +299,17 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         language: str | None = None,
         repo: str | None = None,
         author_login: str | None = None,
+        target: str | None = None,
         k: int = 20,
     ) -> dict[str, Any]:
         """Predict how a candidate PR would be reviewed.
 
-        Embeds the input, pulls the nearest past PRs (by `pr_summary`
-        vector), and aggregates their decisions weighted by similarity.
-
         Args:
-            diff_or_summary: A diff, a PR title+body, or a free-form
-                description of the change you're proposing.
-            language: Optional language filter on the candidate PRs.
-            repo: Optional 'owner/name' filter (org-mode).
-            author_login: Optional reviewer login — when set, we count
-                that reviewer's decision per PR instead of the PR-level
-                outcome (useful in org-mode where there's no single
-                decision).
+            diff_or_summary: A diff, a PR title+body, or a free-form description.
+            language: Optional language filter.
+            repo: Optional 'owner/name' filter.
+            author_login: Optional reviewer login.
+            target: Optional target name. Unset = coalesce with dedup.
             k: How many similar past PRs to pull.
         """
         with tracer().start_as_current_span("mcp.tool.predict_review_outcome") as span:
@@ -313,6 +317,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 span,
                 **{
                     "gh_twin.tool.k": k,
+                    "gh_twin.tool.target": target,
                     "gh_twin.tool.input_chars": len(diff_or_summary or ""),
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
@@ -327,6 +332,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 language=language,
                 repo=repo,
                 author_login=author_login,
+                target=target,
                 k=k,
             )
             _record_result_count(span, result)
@@ -334,23 +340,29 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
 
     @mcp.tool()
     def summarize_review_patterns(
-        language: str | None = None, limit: int = 20
+        language: str | None = None,
+        target: str | None = None,
+        limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Return distilled review rules I've enforced historically.
-
-        Run `gt distill` first to populate. Each rule is a one-sentence pattern
-        plus example quotes from the underlying comments.
+        """Return distilled review rules.
 
         Args:
             language: Optional filter (e.g. 'scala', 'go').
+            target: Optional target name. Unset = coalesce across all targets.
             limit: Max rules to return.
         """
         with tracer().start_as_current_span("mcp.tool.summarize_review_patterns") as span:
             set_safe_attributes(
                 span,
-                **{"gh_twin.tool.limit": limit, "gh_twin.filter.language": language},
+                **{
+                    "gh_twin.tool.limit": limit,
+                    "gh_twin.tool.target": target,
+                    "gh_twin.filter.language": language,
+                },
             )
-            result = t.summarize_review_patterns(conn, language=language, limit=limit)
+            result = t.summarize_review_patterns(
+                conn, language=language, target=target, limit=limit
+            )
             _record_result_count(span, result)
             return result
 
@@ -359,28 +371,18 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         language: str | None = None,
         repo: str | None = None,
         author_login: str | None = None,
+        target: str | None = None,
         scope: Scope = "all",
         limit: int = 50,
     ) -> dict[str, Any]:
         """Return all distilled rules as a single Markdown block.
 
-        Call once at session start and prepend the `markdown` field to
-        your working context — it's the user's house rules + code
-        patterns in one paste-ready document. Static for the session
-        unless `gt distill` is re-run.
-
         Args:
-            language: Strongly recommended in single-language
-                sessions. Without it, the block mixes idioms across
-                every language in the corpus (e.g. a Python session
-                gets Scala rules), which is actively misleading.
-            repo: Optional 'owner/name' filter — only rules whose
-                dominant repo matches.
-            author_login: Optional GH login filter for rules distilled
-                with `--author`.
-            scope: 'personal' fills author_login from a user-mode
-                target; 'project' fills repo from a repo-mode target;
-                'all' (default) is unscoped. Explicit kwargs win.
+            language: Strongly recommended in single-language sessions.
+            repo: Optional 'owner/name' filter.
+            author_login: Optional GH login filter.
+            target: Optional target name. Unset = coalesce across all targets.
+            scope: 'personal' / 'project' / 'all' — see find_review_comments.
             limit: Max rules per source kind (review + code). Default 50.
         """
         with tracer().start_as_current_span("mcp.tool.house_rules") as span:
@@ -389,6 +391,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 **{
                     "gh_twin.tool.limit": limit,
                     "gh_twin.tool.scope": scope,
+                    "gh_twin.tool.target": target,
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
                     "gh_twin.filter.author_login": author_login,
@@ -399,6 +402,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 language=language,
                 repo=repo,
                 author_login=author_login,
+                target=target,
                 scope=scope,
                 limit=limit,
             )
@@ -411,33 +415,24 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         author_login: str | None = None,
         language: str | None = None,
         repo: str | None = None,
+        target: str | None = None,
         scope: Scope = "all",
         n_samples: int = 50,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         """Synthesize a short Markdown profile of one developer's review voice.
 
-        Reads the N most-recent review comments, runs them through the
-        configured LLM (`cfg.summarize.backend`), and returns a 2–3
-        paragraph description suitable for pasting into a system prompt
-        ("act like this reviewer"). Cached per (author, language, repo)
-        tuple until the set of recent comments changes.
-
         Args:
             author_login: GH login to profile. Required in org mode; in
                 user mode, omit to profile the corpus owner.
-            language: Optional language filter on review-comment chunks
-                — narrows the profile to the author's voice when
-                reviewing one language (a Scala reviewer's voice often
-                differs from their Python voice).
-            repo: Optional 'owner/name' filter — narrows to one
-                project's review history.
-            scope: 'personal' fills author_login from a user-mode
-                target; 'project' fills repo from a repo-mode target;
-                'all' (default) is unscoped. Explicit kwargs win.
-            n_samples: Number of recent review comments to base the
-                profile on. 50 is the default; larger = more
-                comprehensive but slower / pricier.
+            language: Optional language filter on review-comment chunks.
+            repo: Optional 'owner/name' filter.
+            target: Optional target name. Unset = coalesce samples across
+                every target the author appears in (with dedup).
+            scope: 'personal' resolves to the user-mode target — the
+                right call when you want a strictly user-mode profile
+                without org-side mirrors of the same commits.
+            n_samples: Number of recent review comments.
             force_refresh: Bypass the cache and re-synthesize.
         """
         with tracer().start_as_current_span("mcp.tool.developer_profile") as span:
@@ -448,6 +443,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                     "gh_twin.tool.n_samples": n_samples,
                     "gh_twin.tool.force_refresh": force_refresh,
                     "gh_twin.tool.scope": scope,
+                    "gh_twin.tool.target": target,
                     "gh_twin.filter.language": language,
                     "gh_twin.filter.repo": repo,
                 },
@@ -458,6 +454,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 author_login=author_login,
                 language=language,
                 repo=repo,
+                target=target,
                 scope=scope,
                 n_samples=n_samples,
                 max_tokens=cfg.summarize.profile_max_tokens,
@@ -468,16 +465,37 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             return result
 
     @mcp.tool()
-    def sync(since: str | None = None) -> dict[str, Any]:
+    def sync(
+        since: str | None = None,
+        target: str | None = None,
+    ) -> dict[str, Any]:
         """Incremental: pull new commits + review comments and embed them.
 
         Args:
             since: ISO date floor. If omitted, uses the stored sync cursor.
+            target: Optional target name. Unset = run ingest for every
+                target in the DB; summarize + embed are corpus-wide.
         """
         with tracer().start_as_current_span("mcp.tool.sync") as span:
-            set_safe_attributes(span, **{"gh_twin.tool.since": since})
+            set_safe_attributes(
+                span,
+                **{"gh_twin.tool.since": since, "gh_twin.tool.target": target},
+            )
             before = q.stats(conn)
-            run_ingest(cfg, conn, since=since, report=lambda m: log.info("%s", m))
+            from github_twin.target import load_target as _load_target
+
+            target_id: int | None = None
+            if target is not None:
+                t = _load_target(conn, name=target)
+                if t is not None and t.id is not None:
+                    target_id = t.id
+            run_ingest(
+                cfg,
+                conn,
+                since=since,
+                target=target_id,
+                report=lambda m: log.info("%s", m),
+            )
             run_embed(cfg, conn, report=lambda m: log.info("%s", m))
             after = q.stats(conn)
             new_vectors = after["vectors"] - before["vectors"]
