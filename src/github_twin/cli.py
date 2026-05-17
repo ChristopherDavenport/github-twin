@@ -1176,6 +1176,15 @@ def eval_search(
         "--expansion",
         help="Override cfg.retrieval.query_expansion: off | rule | ollama.",
     ),
+    recency_half_life_days: float | None = typer.Option(
+        None,
+        "--recency-half-life-days",
+        help=(
+            "Override cfg.retrieval.recency_half_life_days for this run. "
+            "Hybrid-mode only; bm25/vector legs stay unweighted. "
+            "Pass 0 to force-disable when the cfg has a non-None default."
+        ),
+    ),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
     """Retrieval-quality eval."""
@@ -1214,10 +1223,16 @@ def eval_search(
         )
     else:
         expander = expander_from_config(cfg)
+    effective_recency = (
+        recency_half_life_days
+        if recency_half_life_days is not None
+        else cfg.retrieval.recency_half_life_days
+    )
     console.print(
         f"eval search: {len(queries)} queries  k={k}  modes={list(modes)}  "
         f"embedder={getattr(embedder, 'model_id', '?')}  "
-        f"expander={getattr(expander, 'backend_id', 'off')}"
+        f"expander={getattr(expander, 'backend_id', 'off')}  "
+        f"recency_half_life_days={effective_recency}"
     )
     report = evaluate_search(
         conn,
@@ -1227,6 +1242,7 @@ def eval_search(
         k=k,
         modes=modes,
         expander=expander,
+        recency_half_life_days=effective_recency,
     )
     exit_code = render_search_result(report, console)
     if exit_code:
