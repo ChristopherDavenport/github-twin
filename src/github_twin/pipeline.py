@@ -188,36 +188,39 @@ def _ingest_one(
                 report(f"reviews: {s_reviews}")
         return summary
 
+    # User-mode `ingest_commits` and `ingest_reviews` now own their own
+    # per-repo / per-PR transactions internally (mirroring the org-mode
+    # parallel pipeline). No outer transaction here — that would defeat
+    # the per-unit atomicity that protects partial progress against
+    # Ctrl-C and per-worker failures.
     cache = RawCache(cfg.paths.raw_dir)
     summary = {}
     with GitHubClient() as gh:
         if not reviews_only:
-            with transaction(conn):
-                s_commits = ingest_commits(
-                    conn=conn,
-                    gh=gh,
-                    cache=cache,
-                    username=target.name,
-                    emails=target.emails,
-                    cfg=cfg.ingest,
-                    target_id=target.id,
-                    since=since,
-                    limit=limit,
-                )
+            s_commits = ingest_commits(
+                conn=conn,
+                gh=gh,
+                cache=cache,
+                username=target.name,
+                emails=target.emails,
+                cfg=cfg.ingest,
+                target_id=target.id,
+                since=since,
+                limit=limit,
+            )
             summary["commits"] = s_commits
             report(f"commits: {s_commits}")
         if not commits_only:
-            with transaction(conn):
-                s_reviews = ingest_reviews(
-                    conn=conn,
-                    gh=gh,
-                    cache=cache,
-                    username=target.name,
-                    cfg=cfg.ingest,
-                    target_id=target.id,
-                    since=since,
-                    limit_prs=limit,
-                )
+            s_reviews = ingest_reviews(
+                conn=conn,
+                gh=gh,
+                cache=cache,
+                username=target.name,
+                cfg=cfg.ingest,
+                target_id=target.id,
+                since=since,
+                limit_prs=limit,
+            )
             summary["reviews"] = s_reviews
             report(f"reviews: {s_reviews}")
     return summary

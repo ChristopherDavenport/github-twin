@@ -170,12 +170,13 @@ def test_user_mode_persists_walked_sha(conn, monkeypatch, tmp_git_repo):
 
 
 def test_user_mode_incremental_walk_skips_already_seen(conn, monkeypatch, tmp_git_repo):
-    # First pass: one commit.
+    # First pass: one commit dated 2024 (before the cursor stamp).
     tmp_git_repo.make_commit(
         path="a.py",
         content="x=1\n",
         message="first",
         author_email="me@example.com",
+        date="2024-01-02T00:00:00+00:00",
     )
     _patch_commits_clone(monkeypatch, "me/proj", tmp_git_repo.path, tmp_git_repo.head_sha)
     gh = FakeGH(repo_search_results=[{"repository": {"full_name": "me/proj"}}])
@@ -192,12 +193,17 @@ def test_user_mode_incremental_walk_skips_already_seen(conn, monkeypatch, tmp_gi
     first_count = conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='commit'").fetchone()[0]
     assert first_count == 1
 
-    # Second pass with a new commit at HEAD: only the new one is walked.
+    # Second pass: a new commit dated strictly AFTER the cursor that the
+    # first sync stamped (`_now_iso()` is the test-execution wall clock).
+    # The org-mode-style worker walks `git log --since=<cursor>`, so the
+    # new commit must postdate the cursor to be picked up — mirroring the
+    # real-world flow where incremental commits are always "now"-dated.
     tmp_git_repo.make_commit(
         path="b.py",
         content="y=2\n",
         message="second",
         author_email="me@example.com",
+        date="2099-01-01T00:00:00+00:00",
     )
     _patch_commits_clone(monkeypatch, "me/proj", tmp_git_repo.path, tmp_git_repo.head_sha)
     ingest_commits(
