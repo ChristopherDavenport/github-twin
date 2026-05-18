@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS target (
 CREATE TABLE IF NOT EXISTS artifact (
   id           INTEGER PRIMARY KEY,
   target_id    INTEGER NOT NULL REFERENCES target(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL,        -- 'commit' | 'pr' | 'review_comment' | 'issue_comment' | 'file' | 'rule'
+  kind         TEXT NOT NULL,        -- 'commit' | 'pr' | 'review_comment' | 'issue_comment' | 'file' | 'rule' | 'note'
   external_id  TEXT,                  -- commit SHA, PR node id, comment id, etc.
   source_url   TEXT,
   repo         TEXT,
@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS artifact_dedup ON artifact(kind, external_id);
 CREATE TABLE IF NOT EXISTS chunk (
   id           INTEGER PRIMARY KEY,
   artifact_id  INTEGER NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL,         -- 'code' | 'review_comment' | 'commit_message' | 'file' | 'pr_summary' | 'rule' | 'code_rule'
+  kind         TEXT NOT NULL,         -- 'code' | 'review_comment' | 'commit_message' | 'file' | 'pr_summary' | 'rule' | 'code_rule' | 'note'
   text         TEXT NOT NULL,
   context_json TEXT,
   language     TEXT,                  -- per-chunk language (file-level for code, comment's file for review)
