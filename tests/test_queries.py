@@ -380,6 +380,55 @@ def test_target_roundtrip_org(tmp_path: Path):
         db.close()
 
 
+def test_delete_target_handles_more_chunks_than_sqlite_var_limit(tmp_path: Path):
+    """`delete_target` used to bind every chunk_id as a SQL parameter, which
+    blew the SQLITE_MAX_VARIABLE_NUMBER limit on real org corpora. Lower the
+    per-statement variable cap via `setlimit` so we can reproduce the bug
+    without seeding tens of thousands of chunks."""
+    import sqlite3 as _sqlite3
+
+    db = open_db(tmp_path / "many.sqlite", embed_dim=4)
+    try:
+        # SQLITE_LIMIT_VARIABLE_NUMBER = 9. Cap at 999 — SQLite's pre-3.32
+        # default — so the unbatched DELETE blows up at a tractable size and
+        # the batched fix (chunks of 500) still fits safely under it.
+        db.setlimit(_sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        tid = q.upsert_target(db, kind="org", name="bigorg", external_id=42, emails=None)
+        aid = q.upsert_artifact(
+            db,
+            target_id=tid,
+            kind="commit",
+            external_id="sha-many",
+            source_url=None,
+            repo="bigorg/lib",
+            language="python",
+            author_email=None,
+            created_at="2024-01-01",
+            decision=None,
+            meta=None,
+        )
+        n = 1200
+        for i in range(n):
+            cid = q.insert_chunk(
+                db,
+                artifact_id=aid,
+                kind="code",
+                text=f"chunk-{i}",
+                context={"language": "python"},
+                language="python",
+            )
+            q.write_embedding(db, chunk_id=cid, embedding=[1.0, 0.0, 0.0, 0.0], model_id="m")
+        assert db.execute("SELECT COUNT(*) AS n FROM vec_chunk").fetchone()["n"] == n
+
+        q.delete_target(db, tid)
+
+        assert q.get_target_by_id(db, tid) is None
+        assert db.execute("SELECT COUNT(*) AS n FROM chunk").fetchone()["n"] == 0
+        assert db.execute("SELECT COUNT(*) AS n FROM vec_chunk").fetchone()["n"] == 0
+    finally:
+        db.close()
+
+
 def test_repo_upsert_and_list(conn):
     assert q.list_repos(conn) == []
     q.upsert_repo(
