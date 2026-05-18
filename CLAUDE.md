@@ -90,6 +90,13 @@ src/github_twin/
     server.py            # FastMCP entry; defines + registers tools (spans per @mcp.tool)
     tools.py             # pure-Python tool impls (testable without MCP; inner spans for embed + retrieval)
   observability.py       # OTel auto-detect: init_otel() + tracer() + set_safe_attributes()
+  wiki/
+    __init__.py          # re-exports export_wiki, ingest_notes, resolve_vault_root
+    export.py            # gt wiki export: render rules/profiles/repos/index, write-on-diff
+    render.py            # per-entity markdown renderers (frontmatter + body)
+    ingest_notes.py      # scratch/*.md round-trip; SHA-256-keyed kind='note' artifacts
+    scan.py              # frontmatter parser + generated-file walker (prune seam)
+    slug.py              # stable filenames: rule slug + 8-char sha1, owner__name, etc.
   eval/
     holdout.py           # iter_held_out_* + count_eligible
     llm.py               # TextLLM Protocol; Claude/Gemini/Ollama
@@ -174,7 +181,7 @@ prefix shape changes. `run_embed` reads the stored version from
 `sync_cursor` (resource `embed_text_version`); on mismatch it wipes
 `vec_chunk`, nulls `chunk.embed_model`, and re-embeds the whole corpus.
 Brand-new DBs (no vectors yet) skip the wipe and just stamp the current
-version after their first embed pass. Current version: **3**.
+version after their first embed pass. Current version: **4**.
 
 ## Summarize (LLM chunk summaries)
 
@@ -326,8 +333,14 @@ Embeddings never go to a remote API. The LLM seam (`distill`,
 - `chunk_fts_docsize` is the load-bearing probe for "is the index
   populated?" — a plain `SELECT 1 FROM chunk_fts` always returns rows when
   `chunk` has rows, regardless of index state.
-- `artifact.kind` ∈ `{commit, pr, review_comment, issue_comment, file, rule}`
-- `chunk.kind` ∈ `{code, review_comment, commit_message, file, pr_summary, rule, code_rule}`
+- `artifact.kind` ∈ `{commit, pr, review_comment, issue_comment, file, rule, note}`
+- `chunk.kind` ∈ `{code, review_comment, commit_message, file, pr_summary, rule, code_rule, note}`
+  - `note` rides under `artifact.kind='note'` and originates from
+    `<vault>/scratch/*.md` (the wiki round-trip). `external_id` is the
+    SHA-256 of file contents so editing a note swaps the artifact
+    cleanly; `source_url` is the local `file://` path. Notes flow
+    through hybrid_search like any other chunk — no new MCP tool is
+    needed; filter on chunk.kind='note' if you want to scope to them.
   - `rule` and `code_rule` both ride under `artifact.kind='rule'`; the
     chunk-level split lets retrieval filter cheaply. `rule` is
     review-comment-derived (from `gt distill`, default `--kind review`);
@@ -365,8 +378,10 @@ Embeddings never go to a remote API. The LLM seam (`distill`,
 
 # live user-mode DB
 ~/.local/bin/uv run gt stats
-~/.local/bin/uv run gt sync                    # incremental ingest + summarize + embed
+~/.local/bin/uv run gt sync                    # incremental ingest + summarize + embed + wiki export
+~/.local/bin/uv run gt sync --skip-wiki        # skip the scratch-note ingest + vault export
 ~/.local/bin/uv run gt summarize               # standalone (cfg.summarize backend)
+~/.local/bin/uv run gt wiki export             # one-shot: re-render the markdown vault from the DB
 
 # org-mode (fresh data dir)
 GT_PATHS__DATA_DIR=./data-org uv run gt init --kind org --org <name>
@@ -435,6 +450,24 @@ uv run gt eval search      evals/queries/default.yaml      # retrieval-quality d
   name + MCP server name substituted in. Template lives as a Python
   string constant (not a `.md` file) so hatchling needs no
   package-data plumbing.
+- **Wiki vault** (`gt wiki export`, `wiki/` module): materializes the
+  corpus as an Obsidian-compatible markdown vault under
+  `cfg.paths.data_dir/wiki/` (override with `--out` or `cfg.wiki.out`).
+  Three entity sections — `rules/{lang}/{slug}.md`,
+  `profiles/{login}.md`, `repos/{owner}__{name}.md` — plus an
+  `index.md` and per-section `_index.md`. Cross-linked with Obsidian
+  `[[wikilinks]]` and GitHub permalinks. Reuses `q.list_rules`,
+  `q.repo_overview` (new), and `tools.developer_profile` (which caches
+  through `developer_profile_cache`).
+- **Wiki round-trip** (`<vault>/scratch/`, `wiki/ingest_notes.py`):
+  any `.md` dropped into the scratch folder is ingested on the next
+  `gt sync` as a `kind='note'` artifact keyed by SHA-256 of file
+  contents. Auto-generated files everywhere in the vault carry
+  `generated: true` in YAML frontmatter; the scratch ingester walks
+  only `scratch/` and double-checks the marker so re-exports can never
+  loop on themselves. Notes flow through hybrid_search like any other
+  chunk. Bumping the `note` prefix shape in `embed/prefix.py` requires
+  bumping `EMBED_TEXT_VERSION` (currently **4**, was 3 pre-notes).
 - `gt distill` produces `kind='rule'` artifacts keyed by member-chunk-id hash,
   so re-running is idempotent and safe to switch backends mid-stream.
 - Tests use a `FakeEmbedder` (4-dim, pattern-keyed) for deterministic vector
