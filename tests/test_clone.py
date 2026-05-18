@@ -31,17 +31,31 @@ def _patch_git_to_pretend_clone(monkeypatch, *, head_sha: str = "abc123"):
 
     calls: dict[str, list[dict]] = {"fresh": [], "fetch": []}
 
-    def fake_fresh(path: Path, full_name: str, token: str, *, depth=1) -> str:
+    def fake_fresh(
+        path: Path,
+        full_name: str,
+        token: str,
+        *,
+        depth=1,
+        shallow_since=None,
+    ) -> str:
         path.mkdir(parents=True, exist_ok=True)
         (path / ".git").mkdir(exist_ok=True)
         (path / "README.md").write_text("hi")
-        calls["fresh"].append({"path": path, "depth": depth})
+        calls["fresh"].append({"path": path, "depth": depth, "shallow_since": shallow_since})
         return head_sha
 
-    def fake_fetch(path: Path, full_name: str, token: str, *, depth=1) -> str:
+    def fake_fetch(
+        path: Path,
+        full_name: str,
+        token: str,
+        *,
+        depth=1,
+        shallow_since=None,
+    ) -> str:
         # Indicate the existing tree was refreshed.
         (path / "REFRESHED").write_text("yes")
-        calls["fetch"].append({"path": path, "depth": depth})
+        calls["fetch"].append({"path": path, "depth": depth, "shallow_since": shallow_since})
         return head_sha
 
     monkeypatch.setattr(clone_mod, "_fresh_clone", fake_fresh)
