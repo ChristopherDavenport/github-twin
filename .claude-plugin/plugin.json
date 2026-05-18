@@ -1,7 +1,7 @@
 {
   "name": "github-twin",
   "description": "Personal RAG over your GitHub history (commits, code, review comments), served to Claude Code over MCP. Tools: find_code, find_reviews, predict_review_outcome, house_rules, developer_profile, and related retrieval surface.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "author": {
     "name": "Chris Davenport"
   },
@@ -20,7 +20,7 @@
     "github-twin": {
       "command": "uvx",
       "args": [
-        "github-twin@0.0.7",
+        "github-twin@0.0.8",
         "serve"
       ]
     }
