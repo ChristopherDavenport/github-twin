@@ -32,8 +32,22 @@ def conn(tmp_path: Path):
 class FakeGH:
     """Routes /repos/{r}/pulls + per-PR subresources from in-memory fixtures."""
 
+    token = "fake-token"
+
     def __init__(self, repos: dict[str, dict[str, Any]]):
         self.repos = repos
+
+    def get_json(self, path: str, *, params: dict | None = None):
+        # Backs `_fetch_repo_pushed_at`. Default: report no pushed_at so
+        # `_needs_walk` returns True and the existing test behaviour is
+        # preserved (walk every repo).
+        if path.startswith("/repos/") and "/" not in path[len("/repos/") :]:
+            return {}
+        # /repos/<owner>/<name> — single repo info
+        rest = path.removeprefix("/repos/")
+        if rest.count("/") == 1:
+            return self.repos.get(rest, {}).get("info", {})
+        raise AssertionError(f"unexpected get_json: {path}")
 
     def paginate(self, path: str, *, params: dict | None = None):
         # /repos/<repo>/pulls
