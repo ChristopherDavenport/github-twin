@@ -8,26 +8,35 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _default_data_dir() -> Path:
-    """Pick the default data directory based on environment + cwd state.
+def resolve_data_dir() -> Path:
+    """Resolve the data directory from env + XDG, never from cwd.
 
     Priority:
-      1. `./data` in cwd if it already exists — backward-compat for
-         pre-XDG installs (early adopters running `uv run gt sync`
-         from the source tree had their corpus land here).
-      2. `$XDG_DATA_HOME/github-twin` when XDG_DATA_HOME is set
-         (Linux convention; macOS users frequently set this too).
+      1. `GT_PATHS__DATA_DIR` env var.
+      2. `$XDG_DATA_HOME/github-twin` when XDG_DATA_HOME is set.
       3. `~/.local/share/github-twin` (XDG fallback per spec).
 
-    The `GT_PATHS__DATA_DIR` env var always wins — this default only
-    fires when nothing else is configured.
+    Pure function: callers can rely on this returning the same answer
+    regardless of cwd. The config file (`config.toml`) and the DB live
+    under whatever this returns, so the answer must be stable before
+    config is loaded — there is no chicken-and-egg.
     """
-    cwd_data = Path.cwd() / "data"
-    if cwd_data.exists():
-        return cwd_data
+    env = os.environ.get("GT_PATHS__DATA_DIR")
+    if env:
+        return Path(env).expanduser()
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "share"
     return base / "github-twin"
+
+
+def config_path_for(data_dir: Path | None = None) -> Path:
+    """Canonical config.toml path: `<data_dir>/config.toml`."""
+    return (data_dir or resolve_data_dir()) / "config.toml"
+
+
+def _default_data_dir() -> Path:
+    """Pydantic default factory for `PathsCfg.data_dir`."""
+    return resolve_data_dir()
 
 
 class PathsCfg(BaseModel):
@@ -116,7 +125,10 @@ class IngestCfg(BaseModel):
     # Org-mode file ingest knobs (O-C). Default is process-and-purge so a
     # medium org doesn't fill the disk with 50–200 GB of clones.
     cache_clones: bool = False
-    clones_dir: Path = Path("./data/clones")
+    # None resolves to `<paths.data_dir>/clones` at call time via
+    # `resolved_clones_dir(cfg)`. Override here to put clones on a
+    # different disk than the SQLite DB.
+    clones_dir: Path | None = None
     # Repos above this size are skipped entirely (giant monorepos, datasets
     # checked into git, etc.). 500 MB is generous for source code.
     max_repo_size_kb: int = 500_000
@@ -219,7 +231,9 @@ class DistillCfg(BaseModel):
 
 
 class Config(BaseSettings):
-    """Top-level config. Loaded from config.toml in CWD, env vars override individual fields."""
+    """Top-level config. Loaded from `<data_dir>/config.toml`; env vars
+    override individual fields. `--config PATH` (or an explicit `path`
+    argument to `load`) overrides the lookup location."""
 
     model_config = SettingsConfigDict(env_prefix="GT_", env_nested_delimiter="__", extra="ignore")
 
@@ -236,7 +250,7 @@ class Config(BaseSettings):
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Config:
-        candidate = Path(path) if path else Path("config.toml")
+        candidate = Path(path) if path else config_path_for()
         if candidate.exists():
             with candidate.open("rb") as f:
                 data = tomllib.load(f)
@@ -246,3 +260,8 @@ class Config(BaseSettings):
 
 def load_config(path: Path | str | None = None) -> Config:
     return Config.load(path)
+
+
+def resolved_clones_dir(cfg: Config) -> Path:
+    """`cfg.ingest.clones_dir` or `<data_dir>/clones` if unset."""
+    return Path(cfg.ingest.clones_dir) if cfg.ingest.clones_dir else cfg.paths.data_dir / "clones"

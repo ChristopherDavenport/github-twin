@@ -241,8 +241,13 @@ def cloned_repo(
 def commits_clone(
     full_name: str,
     *,
-    cache_dir: Path,
+    cache_dir: Path | None,
     token: str | None = None,
 ) -> AbstractContextManager[ClonedRepo]:
-    """Convenience wrapper for the commits ingest path: persistent + deep."""
+    """Convenience wrapper for the commits ingest path: persistent + deep.
+
+    `cache_dir=None` is accepted for tests that monkeypatch the clone
+    provider; production callers always go through `run_ingest`, which
+    resolves `clones_dir` against `paths.data_dir` before dispatch.
+    """
     return cloned_repo(full_name, cache_dir=cache_dir, token=token, depth=None)

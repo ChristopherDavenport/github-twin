@@ -241,11 +241,29 @@ and never raise into a tool handler.
 
 ## Storage layout + secret hygiene
 
-Default data directory follows XDG: `$XDG_DATA_HOME/github-twin` when
-set, else `~/.local/share/github-twin`. Backward-compat: if `./data`
-exists in the cwd at first run, that wins. `_default_data_dir()` in
-`config.py` encodes this; the `GT_PATHS__DATA_DIR` env var always
-overrides.
+`resolve_data_dir()` in `config.py` is the single source of truth for
+the data directory: `GT_PATHS__DATA_DIR` env var > `$XDG_DATA_HOME/github-twin`
+> `~/.local/share/github-twin`. Pure function — it does NOT read cwd, so
+two `gt init` calls in the same shell layer cleanly into one DB at the
+resolved path. There is no `./data`-in-cwd auto-detect.
+
+Everything per-data-dir lives under that root:
+
+- `<data_dir>/db.sqlite` (the SQLite corpus)
+- `<data_dir>/config.toml` (loaded by `Config.load()` when no `--config`
+  is given; written by `gt init --embed-backend ...` via
+  `_persist_embed_config`)
+- `<data_dir>/raw/` (raw GitHub response cache via `RawCache`)
+- `<data_dir>/clones/` (org-mode persistent clones, when
+  `IngestCfg.clones_dir` is unset — `resolved_clones_dir(cfg)` is the
+  helper)
+- `<data_dir>/wiki/` (`gt wiki export` default output)
+- `<data_dir>/auth/token.json` (OAuth file fallback)
+
+`cli.py:_warn_legacy_cwd_paths` fires a one-shot WARN on every CLI
+invocation if a stray `./config.toml` or `./data/db.sqlite` is sitting
+in the cwd but the resolved data_dir is elsewhere — informational only,
+no auto-move.
 
 Long-lived connections use `db_session()` (in `store/db.py`) — a
 contextmanager that pairs `open_db()` with a guaranteed `close()` and

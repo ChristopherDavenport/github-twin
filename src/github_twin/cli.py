@@ -15,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from github_twin._logging import cap_noisy_loggers, install_secret_redaction
-from github_twin.config import Config, EmbedCfg, load_config
+from github_twin.config import (
+    Config,
+    EmbedCfg,
+    config_path_for,
+    load_config,
+    resolve_data_dir,
+    resolved_clones_dir,
+)
 from github_twin.distill.rules import distill_rules
 from github_twin.distill.synth import CODE_SYSTEM_PROMPT, SYSTEM_PROMPT, make_synthesizer
 from github_twin.embed import Embedder, make_embedder
@@ -89,6 +96,33 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(name)s | %(message)s")
     cap_noisy_loggers()
     install_secret_redaction()
+
+
+def _warn_legacy_cwd_paths() -> None:
+    """Heads-up if files from the old (cwd-relative) layout are sitting in the
+    current directory but the resolved data_dir is elsewhere. One WARN per
+    invocation; no auto-move (silent moves are scarier than the warning).
+    """
+    data_dir = resolve_data_dir()
+    stray_cfg = Path.cwd() / "config.toml"
+    if stray_cfg.is_file() and not (data_dir / "config.toml").exists():
+        log.warning(
+            "Found legacy ./config.toml in cwd but %s does not exist. "
+            "Config now lives next to the DB. Move it with: "
+            "mkdir -p %s && mv %s %s",
+            data_dir / "config.toml",
+            data_dir,
+            stray_cfg,
+            data_dir / "config.toml",
+        )
+    stray_db = Path.cwd() / "data" / "db.sqlite"
+    if stray_db.is_file() and stray_db.parent.resolve() != data_dir.resolve():
+        log.warning(
+            "Found legacy ./data/db.sqlite in cwd but resolved data_dir is %s. "
+            "Set GT_PATHS__DATA_DIR=%s if you want to keep using this DB.",
+            data_dir,
+            stray_db.parent,
+        )
 
 
 def _ctx(config_path: Path | None) -> tuple[Config, sqlite3.Connection]:
@@ -184,6 +218,17 @@ def _report(msg: str) -> None:
     console.print(msg)
 
 
+def _print_locations(cfg: Config, config_override: Path | None) -> None:
+    """Show user-facing paths at the end of `gt init`."""
+    config_path = (
+        config_override if config_override is not None else config_path_for(cfg.paths.data_dir)
+    )
+    console.print()
+    console.print(f"Data dir: [bold]{cfg.paths.data_dir}[/bold]")
+    console.print(f"Config:   {config_path}")
+    console.print(f"DB:       {cfg.paths.db_path}")
+
+
 def _run_ingest_safely(
     cfg: Config,
     conn: sqlite3.Connection,
@@ -220,6 +265,7 @@ def main(
 ) -> None:
     _setup_logging(verbose)
     init_otel()
+    _warn_legacy_cwd_paths()
 
 
 @app.command()
@@ -272,7 +318,8 @@ def init(
         resolved_backend, resolved_model, resolved_dim = _resolve_embed_defaults(
             embed_backend, embed_model, embed_dim
         )
-        target_config = config if config is not None else Path("config.toml")
+        target_config = config if config is not None else config_path_for()
+        target_config.parent.mkdir(parents=True, exist_ok=True)
         _persist_embed_config(target_config, resolved_backend, resolved_model, resolved_dim)
         console.print(
             f"[dim]Embed config written to {target_config}: "
@@ -295,7 +342,7 @@ def init(
                     f"(id {target.external_id}) [dim](auto-detected)[/dim]"
                 )
                 console.print(f"Default branch: {metadata['default_branch']}")
-                console.print(f"\nDB: {cfg.paths.db_path}")
+                _print_locations(cfg, config)
                 return
         kind = "user"
         console.print("[dim]No github.com .git found; falling back to user mode.[/dim]")
@@ -351,7 +398,7 @@ def init(
     else:
         console.print(f"[red]Unknown --kind: {kind!r}. Expected 'user', 'org', or 'repo'.[/red]")
         raise typer.Exit(2)
-    console.print(f"\nDB: {cfg.paths.db_path}")
+    _print_locations(cfg, config)
 
 
 @app.command("init-claude-md")
@@ -1089,7 +1136,7 @@ def clones_prune(
     cfg, conn = _ctx(config)
     keep = q.all_cached_repos(conn)
     decisions = prune_cache(
-        cfg.ingest.clones_dir,
+        resolved_clones_dir(cfg),
         keep=keep,
         older_than_days=older_than_days,
         dry_run=dry_run,

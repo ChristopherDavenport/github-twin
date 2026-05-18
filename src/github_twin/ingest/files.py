@@ -105,7 +105,7 @@ def ingest_files(
     repos = q.list_repos(conn, target_id=target_id)
     if limit is not None:
         repos = repos[:limit]
-    cache_dir: Path | None = Path(cfg.clones_dir) if cfg.cache_clones else None
+    cache_dir: Path | None = Path(cfg.clones_dir) if cfg.cache_clones and cfg.clones_dir else None
 
     for row in repos:
         full_name: str = row["full_name"]
