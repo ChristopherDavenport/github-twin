@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.christopherdavenport/github-twin",
+  "name": "io.github.ChristopherDavenport/github-twin",
   "title": "github-twin",
   "description": "Personal RAG over your GitHub history (commits, code, reviews), served to Claude Code over MCP.",
   "version": "0.0.4",
