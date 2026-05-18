@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS artifact (
   created_at   TEXT,                  -- ISO8601
   decision     TEXT,                  -- 'approved' | 'changes_requested' | 'commented' | NULL
   meta_json    TEXT,
+  content_hash TEXT,                  -- sha256 of the source content (diff for commits, body for comments); NULL on legacy rows. Lets re-ingest skip chunk wipe+re-insert when the content hasn't changed.
   UNIQUE(target_id, kind, external_id)
 );
 
