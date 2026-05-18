@@ -19,7 +19,12 @@ from github_twin.embed import Embedder, make_embedder
 from github_twin.embed.prefix import prefix_chunk
 from github_twin.eval.llm import TextLLM, make_text_llm
 from github_twin.ingest.cache import RawCache
-from github_twin.ingest.commits import ingest_commits, ingest_commits_org
+from github_twin.ingest.commits import (
+    _allowed_repo,
+    _fetch_repo_pushed_at,
+    ingest_commits,
+    ingest_commits_org,
+)
 from github_twin.ingest.files import ingest_files
 from github_twin.ingest.github_client import GitHubClient
 from github_twin.ingest.reviews import ingest_reviews, ingest_reviews_org
@@ -56,6 +61,23 @@ Reporter = Callable[[str], None]
 
 def _noop(_: str) -> None:
     return None
+
+
+def _prefetch_pushed_at(
+    conn: sqlite3.Connection,
+    gh: GitHubClient,
+    cfg: Config,
+    target_id: int,
+) -> dict[str, str | None]:
+    """One pass over `/repos/{r}` per sync, shared by commits + reviews legs."""
+    repos = [
+        r["full_name"]
+        for r in q.list_repos(conn, target_id=target_id)
+        if _allowed_repo(r["full_name"], cfg.ingest)
+    ]
+    if not repos:
+        return {}
+    return _fetch_repo_pushed_at(gh, repos, max_workers=cfg.ingest.repo_concurrency)
 
 
 def _resolve_targets(conn: sqlite3.Connection, target_filter: int | str | None) -> list[Target]:
@@ -135,28 +157,33 @@ def _ingest_one(
             summary["files"] = s_files
             report(f"files: {s_files}")
         with GitHubClient() as gh:
+            # Share the /repos/{r} batch across the commits + reviews phases
+            # so the fast-skip pre-check costs one round of API calls per
+            # sync, not two. Each phase still owns its own per-repo
+            # transactions internally.
+            pushed_at_by_repo = _prefetch_pushed_at(conn, gh, cfg, target.id)
             if not reviews_only:
-                with transaction(conn):
-                    s_commits = ingest_commits_org(
-                        conn=conn,
-                        gh=gh,
-                        cache=cache,
-                        cfg=cfg.ingest,
-                        target_id=target.id,
-                        limit_per_repo=limit,
-                    )
+                s_commits = ingest_commits_org(
+                    conn=conn,
+                    gh=gh,
+                    cache=cache,
+                    cfg=cfg.ingest,
+                    target_id=target.id,
+                    limit_per_repo=limit,
+                    pushed_at_by_repo=pushed_at_by_repo,
+                )
                 summary["commits"] = s_commits
                 report(f"commits: {s_commits}")
             if not commits_only:
-                with transaction(conn):
-                    s_reviews = ingest_reviews_org(
-                        conn=conn,
-                        gh=gh,
-                        cache=cache,
-                        cfg=cfg.ingest,
-                        target_id=target.id,
-                        limit_prs_per_repo=limit,
-                    )
+                s_reviews = ingest_reviews_org(
+                    conn=conn,
+                    gh=gh,
+                    cache=cache,
+                    cfg=cfg.ingest,
+                    target_id=target.id,
+                    limit_prs_per_repo=limit,
+                    pushed_at_by_repo=pushed_at_by_repo,
+                )
                 summary["reviews"] = s_reviews
                 report(f"reviews: {s_reviews}")
         return summary
