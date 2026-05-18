@@ -25,6 +25,10 @@ from typing import Any
 # Sentinel target_id for cross-target sync cursors (e.g. embed_text_version).
 GLOBAL_TARGET_ID = 0
 
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk IN-clauses to stay
+# well clear. An org-mode target can hold hundreds of thousands of chunks.
+_VAR_BATCH = 500
+
 # ---------- Helpers ----------
 
 
@@ -159,9 +163,12 @@ def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
             (target_id,),
         ).fetchall()
     ]
-    if chunk_ids:
-        placeholders = ",".join("?" * len(chunk_ids))
-        conn.execute(f"DELETE FROM vec_chunk WHERE chunk_id IN ({placeholders})", chunk_ids)
+    # Batch the IN clause: SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999,
+    # and an org-mode corpus blows past that easily.
+    for i in range(0, len(chunk_ids), _VAR_BATCH):
+        batch = chunk_ids[i : i + _VAR_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        conn.execute(f"DELETE FROM vec_chunk WHERE chunk_id IN ({placeholders})", batch)
     conn.execute("DELETE FROM sync_cursor WHERE target_id = ?", (target_id,))
     conn.execute("DELETE FROM target WHERE id = ?", (target_id,))
 
