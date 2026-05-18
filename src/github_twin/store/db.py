@@ -48,8 +48,21 @@ def open_db(db_path: Path, embed_dim: int) -> sqlite3.Connection:
     with SCHEMA_PATH.open() as f:
         conn.executescript(f.read())
     _ensure_vec_table(conn, embed_dim)
+    _migrate_artifact_columns(conn)
     _backfill_fts(conn)
     return conn
+
+
+def _migrate_artifact_columns(conn: sqlite3.Connection) -> None:
+    """Backfill columns onto pre-existing `artifact` tables.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op when the table exists, so newly
+    added columns in schema.sql don't reach DBs that were created before the
+    column was added. Detect missing columns via PRAGMA and ALTER them in.
+    """
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(artifact)").fetchall()}
+    if "content_hash" not in have:
+        conn.execute("ALTER TABLE artifact ADD COLUMN content_hash TEXT")
 
 
 def _backfill_fts(conn: sqlite3.Connection) -> None:
