@@ -476,3 +476,6 @@ walkthrough.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+<!-- MCP registry ownership marker (do not remove) -->
+mcp-name: io.github.ChristopherDavenport/github-twin
