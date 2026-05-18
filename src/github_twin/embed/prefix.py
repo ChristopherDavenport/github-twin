@@ -50,6 +50,8 @@ def build_header(chunk: q.ChunkRow) -> str:
         return f"{repo_line}\n{sum_line}\n" if sum_line else base
     if chunk.kind == "review_comment":
         return _review_comment_header(ctx)
+    if chunk.kind == "note":
+        return _note_header(ctx)
     return ""
 
 
@@ -94,6 +96,16 @@ def _commit_message_header(ctx: dict[str, Any]) -> str:
         return ""
     short = sha[:7] if sha else "?"
     return f"# commit {repo or '?'}@{short}\n\n"
+
+
+def _note_header(ctx: dict[str, Any]) -> str:
+    """Scratch-note prefix: `# note: {title}` (or path fallback). Lets
+    NL queries land on note chunks by topic rather than requiring a
+    keyword inside the body."""
+    title = ctx.get("title") or ctx.get("path") or ""
+    if not title:
+        return ""
+    return f"# note: {title}\n\n"
 
 
 def _review_comment_header(ctx: dict[str, Any]) -> str:

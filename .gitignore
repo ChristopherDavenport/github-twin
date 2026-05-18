@@ -16,6 +16,9 @@ src/github_twin/_version.py
 config.toml
 .env
 data/
+# Preview output from `gt wiki export --out wiki-preview/` while iterating
+# on the vault shape; the real vault lives under `<data_dir>/wiki/`.
+wiki-preview/
 
 # Claude Code per-machine state
 .claude/settings.local.json

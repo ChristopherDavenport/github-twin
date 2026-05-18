@@ -944,6 +944,168 @@ def bm25_search(
     return hits
 
 
+# ---------- Per-repo / per-author rollups (wiki vault) ----------
+
+
+def repo_overview(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    full_name: str,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Aggregate per-repo stats for the wiki vault's repo overview page.
+
+    Returns counts by kind, top file paths (chunk count desc), top
+    contributors (distinct author_login counts), plus pass-through
+    metadata (default_branch, head_sha, pushed_at) from the `repo` row.
+
+    Top-paths uses `json_extract(chunk.context_json, '$.path')` since
+    the file path lives only in the per-chunk context dict in this
+    schema — there's no top-level `artifact.path` column.
+    """
+    counts: dict[str, int] = {
+        r["kind"]: r["n"]
+        for r in conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM artifact "
+            "WHERE target_id = ? AND repo = ? GROUP BY kind",
+            (target_id, full_name),
+        ).fetchall()
+    }
+    top_paths = [
+        (r["path"], r["n"])
+        for r in conn.execute(
+            "SELECT json_extract(c.context_json, '$.path') AS path, COUNT(*) AS n "
+            "FROM chunk c JOIN artifact a ON a.id = c.artifact_id "
+            "WHERE a.target_id = ? AND a.repo = ? "
+            "AND json_extract(c.context_json, '$.path') IS NOT NULL "
+            "GROUP BY path ORDER BY n DESC LIMIT ?",
+            (target_id, full_name, top_n),
+        ).fetchall()
+    ]
+    top_authors = [
+        (r["author_login"], r["n"])
+        for r in conn.execute(
+            "SELECT author_login, COUNT(*) AS n FROM artifact "
+            "WHERE target_id = ? AND repo = ? AND author_login IS NOT NULL "
+            "GROUP BY author_login ORDER BY n DESC LIMIT ?",
+            (target_id, full_name, top_n),
+        ).fetchall()
+    ]
+    repo_row = conn.execute(
+        "SELECT default_branch, head_sha, pushed_at, archived, fork "
+        "FROM repo WHERE target_id = ? AND full_name = ?",
+        (target_id, full_name),
+    ).fetchone()
+    meta = dict(repo_row) if repo_row else {}
+    return {
+        "full_name": full_name,
+        "counts": counts,
+        "top_paths": top_paths,
+        "top_authors": top_authors,
+        "default_branch": meta.get("default_branch"),
+        "head_sha": meta.get("head_sha"),
+        "pushed_at": meta.get("pushed_at"),
+        "archived": bool(meta.get("archived", 0)),
+        "fork": bool(meta.get("fork", 0)),
+    }
+
+
+def list_authors_for_target(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    min_review_comments: int = 1,
+) -> list[tuple[str, int]]:
+    """Return `[(author_login, review_comment_count), ...]` ordered by
+    count desc, for authors meeting `min_review_comments`.
+
+    Source of truth is `review_comment` artifacts — this is what
+    `developer_profile` samples from. User-mode targets have
+    `author_login IS NULL` on every artifact by design (the corpus is
+    one person) and so return an empty list here; the wiki exporter
+    handles that case by falling back to the target's own name.
+    """
+    rows = conn.execute(
+        "SELECT author_login, COUNT(*) AS n FROM artifact "
+        "WHERE target_id = ? AND kind = 'review_comment' "
+        "AND author_login IS NOT NULL "
+        "GROUP BY author_login HAVING n >= ? ORDER BY n DESC, author_login",
+        (target_id, min_review_comments),
+    ).fetchall()
+    return [(r["author_login"], r["n"]) for r in rows]
+
+
+def upsert_note_artifact(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    external_id: str,
+    source_url: str,
+    meta: dict[str, Any] | None,
+) -> int:
+    """Convenience writer for scratch-note artifacts. Same call shape as
+    `upsert_artifact` but pre-fills the discriminator fields that don't
+    apply to notes (kind, repo, language, decision, author_email)."""
+    return upsert_artifact(
+        conn,
+        target_id=target_id,
+        kind="note",
+        external_id=external_id,
+        source_url=source_url,
+        repo=None,
+        language=None,
+        author_email=None,
+        author_login=None,
+        created_at=_now_iso(),
+        decision=None,
+        meta=meta,
+    )
+
+
+def list_note_artifacts(conn: sqlite3.Connection, *, target_id: int) -> list[dict[str, Any]]:
+    """All kind='note' artifacts for `target_id`. Used by ingest_notes
+    to find ones whose source file has been deleted from disk."""
+    rows = conn.execute(
+        "SELECT id, external_id, source_url, meta_json FROM artifact "
+        "WHERE target_id = ? AND kind = 'note'",
+        (target_id,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "external_id": r["external_id"],
+                "source_url": r["source_url"],
+                "meta": json.loads(r["meta_json"]) if r["meta_json"] else {},
+            }
+        )
+    return out
+
+
+def delete_artifact(conn: sqlite3.Connection, artifact_id: int) -> None:
+    """Remove an artifact + cascade its chunks/vectors.
+
+    Chunks cascade via FK ON DELETE CASCADE; vec_chunk rows are NOT FK'd
+    (sqlite-vec virtual tables can't be foreign-key referenced) so we
+    wipe them first by chunk_id, identical to the pattern in
+    `delete_chunks_for_artifact`. Order: vec_chunk → chunk (triggers
+    chunk_ad which removes chunk_fts rows) → artifact.
+    """
+    chunk_ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM chunk WHERE artifact_id = ?", (artifact_id,)
+        ).fetchall()
+    ]
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(f"DELETE FROM vec_chunk WHERE chunk_id IN ({placeholders})", chunk_ids)
+    conn.execute("DELETE FROM chunk WHERE artifact_id = ?", (artifact_id,))
+    conn.execute("DELETE FROM artifact WHERE id = ?", (artifact_id,))
+
+
 # ---------- Recency lookup ----------
 
 # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk 500 to stay well clear
