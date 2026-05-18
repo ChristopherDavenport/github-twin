@@ -6,12 +6,22 @@
 opt-in via `cache_dir=<path>` — clones live under `<cache_dir>/<owner>/<name>`
 and `git fetch` updates on reuse.
 
-Clone depth: pass `depth=None` for a full-history clone (used by commits
-ingest, which walks `git log` + `git show` locally instead of hitting the
-API). Default is `depth=1` (shallow, HEAD only) which is what `files.py`
-needs for its HEAD walk. If a persistent cache was previously shallow and
-the caller now asks for full history, the existing checkout is unshallowed
-once via `git fetch --unshallow` and subsequent fetches stay deep.
+Clone size: three modes, picked by parameters in priority order:
+
+- `shallow_since="<ISO date>"` — bounded by date AND `--filter=blob:none`.
+  This is the commits-ingest mode: we get all refs and trees newer than
+  `<date>` but blobs only download lazily when `git show` touches them.
+  Collapses multi-GB monorepo clones into tens of MB up front. The
+  shallow boundary can be moved forward on a later fetch with a more
+  recent date; commits older than the original `<date>` stay absent
+  unless an even older `<date>` is supplied.
+- `depth=None` — full history. Heavy; only use when shallow_since
+  isn't tractable (e.g. a tool that needs to walk arbitrary history).
+- `depth=N` (default `1`) — N latest commits on the default branch.
+  This is the `files.py` mode for HEAD walks.
+
+`depth=None` semantics are preserved for tests that monkeypatch around
+this module; production commits ingest uses `shallow_since`.
 
 Auth: the token is injected into the clone URL as
 `https://oauth2:<token>@github.com/<full_name>.git`. Immediately after
@@ -90,9 +100,25 @@ def _scrub_remote(path: Path, full_name: str) -> None:
     _git(["remote", "set-url", "origin", _public_url(full_name)], cwd=path)
 
 
-def _fresh_clone(path: Path, full_name: str, token: str, *, depth: int | None = 1) -> str:
+def _fresh_clone(
+    path: Path,
+    full_name: str,
+    token: str,
+    *,
+    depth: int | None = 1,
+    shallow_since: str | None = None,
+) -> str:
     args = ["clone", "--no-tags"]
-    if depth is not None:
+    if shallow_since is not None:
+        # Date-bounded + lazy blobs. The partial-clone filter is the size
+        # multiplier — without it, --shallow-since still downloads every
+        # blob reachable from refs newer than the cutoff.
+        args += [
+            f"--shallow-since={shallow_since}",
+            "--filter=blob:none",
+            "--single-branch",
+        ]
+    elif depth is not None:
         args += ["--depth", str(depth), "--single-branch"]
     args += [_auth_url(full_name, token), str(path)]
     _git(args)
@@ -104,16 +130,35 @@ def _is_shallow(path: Path) -> bool:
     return _git(["rev-parse", "--is-shallow-repository"], cwd=path) == "true"
 
 
-def _fetch_update(path: Path, full_name: str, token: str, *, depth: int | None = 1) -> str:
+def _fetch_update(
+    path: Path,
+    full_name: str,
+    token: str,
+    *,
+    depth: int | None = 1,
+    shallow_since: str | None = None,
+) -> str:
     """Re-point origin to the auth URL just for the fetch, then scrub again.
 
-    `depth=1` keeps shallow clones shallow. `depth=None` requests a full
-    history fetch — if the existing clone is shallow we run `--unshallow`
-    first to backfill the history, then subsequent fetches are plain.
+    `shallow_since` extends the shallow boundary forward (newer-than-date).
+    Passing an *earlier* date than a prior fetch backfills history down to
+    that earlier cutoff. `depth=1` keeps shallow clones shallow.
+    `depth=None` requests a full-history fetch — if the existing clone is
+    shallow we run `--unshallow` first.
     """
     _git(["remote", "set-url", "origin", _auth_url(full_name, token)], cwd=path)
     try:
-        if depth is None:
+        if shallow_since is not None:
+            _git(
+                [
+                    "fetch",
+                    f"--shallow-since={shallow_since}",
+                    "--no-tags",
+                    "origin",
+                ],
+                cwd=path,
+            )
+        elif depth is None:
             if _is_shallow(path):
                 _git(["fetch", "--unshallow", "--no-tags", "origin"], cwd=path)
             else:
@@ -210,19 +255,23 @@ def cloned_repo(
     cache_dir: Path | None = None,
     token: str | None = None,
     depth: int | None = 1,
+    shallow_since: str | None = None,
 ) -> Iterator[ClonedRepo]:
     """Yield a working-tree path for `full_name`.
 
-    cache_dir=None  → tempdir, deleted on exit.
-    cache_dir=<p>   → persistent under `<p>/<owner>/<name>`, retained on exit.
-    depth=1         → shallow clone (default; HEAD only).
-    depth=None      → full-history clone (commits ingest path).
+    cache_dir=None     → tempdir, deleted on exit.
+    cache_dir=<p>      → persistent under `<p>/<owner>/<name>`, retained.
+    shallow_since=<d>  → date-bounded + lazy blobs (commits ingest).
+    depth=1            → shallow clone (default; HEAD only).
+    depth=None         → full-history clone (legacy / tests).
+
+    `shallow_since` takes precedence over `depth` when both are supplied.
     """
     tok = token or _resolve_token()
     if cache_dir is None:
         tmp = Path(tempfile.mkdtemp(prefix="gt-clone-"))
         try:
-            head = _fresh_clone(tmp, full_name, tok, depth=depth)
+            head = _fresh_clone(tmp, full_name, tok, depth=depth, shallow_since=shallow_since)
             yield ClonedRepo(full_name=full_name, path=tmp, head_sha=head, from_cache=False)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -231,10 +280,10 @@ def cloned_repo(
         target = cache_dir / owner / name
         target.parent.mkdir(parents=True, exist_ok=True)
         if (target / ".git").is_dir():
-            head = _fetch_update(target, full_name, tok, depth=depth)
+            head = _fetch_update(target, full_name, tok, depth=depth, shallow_since=shallow_since)
             yield ClonedRepo(full_name=full_name, path=target, head_sha=head, from_cache=True)
         else:
-            head = _fresh_clone(target, full_name, tok, depth=depth)
+            head = _fresh_clone(target, full_name, tok, depth=depth, shallow_since=shallow_since)
             yield ClonedRepo(full_name=full_name, path=target, head_sha=head, from_cache=False)
 
 
@@ -243,11 +292,23 @@ def commits_clone(
     *,
     cache_dir: Path | None,
     token: str | None = None,
+    shallow_since: str | None = None,
 ) -> AbstractContextManager[ClonedRepo]:
-    """Convenience wrapper for the commits ingest path: persistent + deep.
+    """Convenience wrapper for the commits ingest path.
+
+    `shallow_since` is the production knob (date-bounded clone with lazy
+    blobs). If unset, falls back to a full-history clone for backward
+    compatibility with tests that monkeypatch this seam.
 
     `cache_dir=None` is accepted for tests that monkeypatch the clone
     provider; production callers always go through `run_ingest`, which
     resolves `clones_dir` against `paths.data_dir` before dispatch.
     """
-    return cloned_repo(full_name, cache_dir=cache_dir, token=token, depth=None)
+    depth: int | None = None if shallow_since is None else 1
+    return cloned_repo(
+        full_name,
+        cache_dir=cache_dir,
+        token=token,
+        depth=depth,
+        shallow_since=shallow_since,
+    )
