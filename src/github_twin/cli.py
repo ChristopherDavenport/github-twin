@@ -241,6 +241,28 @@ def _run_ingest_safely(
         raise typer.Exit(1) from None
 
 
+def _swap_fork_to_upstream(
+    gh: GitHubClient,
+    target: Target,
+    metadata: dict[str, Any],
+    parent_full_name: str | None,
+    *,
+    keep_fork: bool,
+) -> tuple[Target, dict[str, Any]]:
+    """If the discovered repo is a fork, re-run discovery against its parent
+    and return the upstream's (target, metadata). Returns the original pair
+    unchanged when `keep_fork` is true or no parent was reported."""
+    if keep_fork or parent_full_name is None:
+        return target, metadata
+    console.print(
+        f"[dim]{target.name} is a fork of {parent_full_name}; "
+        f"using upstream as the target so review comments and PRs are "
+        f"ingested. Pass --keep-fork to keep the fork instead.[/dim]"
+    )
+    new_target, new_metadata, _ = discover_repo(gh, repo=parent_full_name)
+    return new_target, new_metadata
+
+
 # ---------- Typer commands ----------
 
 
@@ -306,6 +328,16 @@ def init(
         "--embed-dim",
         help="Embedding dimension. Defaults per backend (768 ollama / 3072 gemini).",
     ),
+    keep_fork: bool = typer.Option(
+        False,
+        "--keep-fork",
+        help=(
+            "When the resolved repo is a fork, keep it as the target instead "
+            "of auto-swapping to its upstream parent. Default: swap, so "
+            "upstream review comments and PRs are ingested. Applies to both "
+            "--kind=repo and the --kind=auto .git-detect path."
+        ),
+    ),
     config: Path | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Add a target (user / org / repo) to this DB.
@@ -332,7 +364,10 @@ def init(
         with GitHubClient() as gh:
             auto = maybe_discover_repo(gh)
             if auto is not None:
-                target, metadata, _ = auto
+                target, metadata, parent_full_name = auto
+                target, metadata = _swap_fork_to_upstream(
+                    gh, target, metadata, parent_full_name, keep_fork=keep_fork
+                )
                 with transaction(conn):
                     target = save_target(conn, target)
                     assert target.id is not None
@@ -385,10 +420,13 @@ def init(
     elif kind == "repo":
         with GitHubClient() as gh:
             try:
-                target, metadata, _ = discover_repo(gh, repo=repo)
+                target, metadata, parent_full_name = discover_repo(gh, repo=repo)
             except ValueError as exc:
                 console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(2) from None
+            target, metadata = _swap_fork_to_upstream(
+                gh, target, metadata, parent_full_name, keep_fork=keep_fork
+            )
         with transaction(conn):
             target = save_target(conn, target)
             assert target.id is not None
