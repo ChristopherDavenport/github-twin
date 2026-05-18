@@ -76,14 +76,19 @@ def test_find_git_root_returns_none_when_no_git(tmp_path: Path):
 
 
 class FakeGH:
-    """Stubs GitHubClient.get_json with a fixed response."""
+    """Stubs GitHubClient.get_json with a fixed response or a per-path map."""
 
-    def __init__(self, response: dict[str, Any]):
+    def __init__(
+        self, response: dict[str, Any] | dict[str, dict[str, Any]], *, by_path: bool = False
+    ):
         self._response = response
+        self._by_path = by_path
         self.calls: list[str] = []
 
     def get_json(self, path: str, *, params: dict[str, Any] | None = None):
         self.calls.append(path)
+        if self._by_path:
+            return self._response[path]  # type: ignore[index]
         return self._response
 
 
@@ -99,9 +104,31 @@ def _fake_repo_response(full_name: str = "foo/bar", repo_id: int = 12345) -> dic
     }
 
 
+def _fake_fork_response(
+    full_name: str = "me/fork",
+    repo_id: int = 555,
+    parent_full_name: str = "up/x",
+    parent_id: int = 999,
+) -> dict:
+    """Mirror what GitHub returns for a fork: fork=true + parent block."""
+    return {
+        "id": repo_id,
+        "full_name": full_name,
+        "default_branch": "main",
+        "pushed_at": "2024-01-01T00:00:00Z",
+        "archived": False,
+        "fork": True,
+        "size": 1,
+        "parent": {
+            "id": parent_id,
+            "full_name": parent_full_name,
+        },
+    }
+
+
 def test_discover_repo_with_explicit_arg():
     gh = FakeGH(_fake_repo_response())
-    target, meta = discover_repo(gh, repo="foo/bar")
+    target, meta, parent = discover_repo(gh, repo="foo/bar")
     assert target.kind == "repo"
     assert target.is_repo is True
     assert target.name == "foo/bar"
@@ -111,6 +138,7 @@ def test_discover_repo_with_explicit_arg():
     assert meta["full_name"] == "foo/bar"
     assert meta["default_branch"] == "main"
     assert meta["size_kb"] == 42
+    assert parent is None
 
 
 def test_discover_repo_from_git_dir(tmp_path: Path):
@@ -120,11 +148,31 @@ def test_discover_repo_from_git_dir(tmp_path: Path):
         '[remote "origin"]\n    url = https://github.com/typelevel/cats-effect.git\n'
     )
     gh = FakeGH(_fake_repo_response("typelevel/cats-effect", repo_id=987))
-    target, meta = discover_repo(gh, start_path=tmp_path)
+    target, meta, parent = discover_repo(gh, start_path=tmp_path)
     assert target.name == "typelevel/cats-effect"
     assert target.external_id == 987
     assert gh.calls == ["/repos/typelevel/cats-effect"]
     assert meta["full_name"] == "typelevel/cats-effect"
+    assert parent is None
+
+
+def test_discover_repo_reports_parent_for_forks():
+    """`fork=true` with a parent block surfaces the upstream full_name."""
+    gh = FakeGH(_fake_fork_response("me/fork", parent_full_name="up/x"))
+    target, meta, parent = discover_repo(gh, repo="me/fork")
+    assert target.name == "me/fork"
+    assert meta["fork"] is True
+    assert parent == "up/x"
+
+
+def test_discover_repo_returns_none_parent_when_fork_lacks_parent_block():
+    """Defensive: malformed API response (fork=true, no parent) → parent None."""
+    response = _fake_fork_response()
+    del response["parent"]
+    gh = FakeGH(response)
+    target, meta, parent = discover_repo(gh, repo="me/fork")
+    assert meta["fork"] is True
+    assert parent is None
 
 
 def test_discover_repo_rejects_bad_owner_name():
@@ -162,8 +210,23 @@ def test_maybe_discover_repo_returns_target_on_success(tmp_path: Path):
     gh = FakeGH(_fake_repo_response("me/x"))
     result = maybe_discover_repo(gh, start_path=tmp_path)
     assert result is not None
-    target, meta = result
+    target, meta, parent = result
     assert target.is_repo and target.name == "me/x"
+    assert parent is None
+
+
+def test_maybe_discover_repo_surfaces_parent_for_forks(tmp_path: Path):
+    """Auto-detect inside a fork's working tree must propagate the parent."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text(
+        '[remote "origin"]\n    url = git@github.com:me/fork.git\n'
+    )
+    gh = FakeGH(_fake_fork_response("me/fork", parent_full_name="up/x"))
+    result = maybe_discover_repo(gh, start_path=tmp_path)
+    assert result is not None
+    target, meta, parent = result
+    assert target.name == "me/fork"
+    assert parent == "up/x"
 
 
 # ---------- pipeline dispatch ----------

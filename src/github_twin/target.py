@@ -157,15 +157,18 @@ def discover_repo(
     *,
     repo: str | None = None,
     start_path: Path | None = None,
-) -> tuple[Target, dict[str, Any]]:
+) -> tuple[Target, dict[str, Any], str | None]:
     """Discover a repo target.
 
     - If `repo='owner/name'` is given, use it directly.
     - Else walk up from `start_path or Path.cwd()` to find `.git/config`,
       parse its `origin` URL, and use the resulting `'owner/name'`.
 
-    Returns `(Target, repo_metadata_dict)` where the second value is shaped
-    for `q.upsert_repo(**metadata)` (without target_id; the caller stamps it).
+    Returns `(Target, repo_metadata_dict, parent_full_name)` where the
+    second value is shaped for `q.upsert_repo(**metadata)` (without
+    target_id; the caller stamps it). The third value is the upstream
+    `owner/name` when the resolved repo is a fork with a parent, else
+    `None` — callers use it to decide whether to swap the target.
     """
     if repo is None:
         root = _find_git_root(start_path or Path.cwd())
@@ -195,12 +198,19 @@ def discover_repo(
         owner, name = repo.split("/", 1)
 
     data = gh.get_json(f"/repos/{owner}/{name}")
+    is_fork = bool(data.get("fork", False))
+    parent_full_name: str | None = None
+    if is_fork:
+        parent = data.get("parent") or {}
+        raw_parent_name = parent.get("full_name")
+        if isinstance(raw_parent_name, str) and raw_parent_name:
+            parent_full_name = raw_parent_name
     metadata = {
         "full_name": data.get("full_name") or full_name,
         "default_branch": data.get("default_branch"),
         "pushed_at": data.get("pushed_at"),
         "archived": bool(data.get("archived", False)),
-        "fork": bool(data.get("fork", False)),
+        "fork": is_fork,
         "size_kb": data.get("size"),
     }
     target = Target(
@@ -209,7 +219,7 @@ def discover_repo(
         external_id=int(data["id"]),
         emails=[],
     )
-    return target, metadata
+    return target, metadata, parent_full_name
 
 
 # ---------- persistence ----------
@@ -306,12 +316,14 @@ def save_target(conn: sqlite3.Connection, target: Target) -> Target:
 
 def maybe_discover_repo(
     gh: GitHubClient, *, start_path: Path | None = None
-) -> tuple[Target, dict[str, Any]] | None:
+) -> tuple[Target, dict[str, Any], str | None] | None:
     """Best-effort repo discovery for `gt init` auto-detect mode.
 
-    Returns (target, metadata) on success, None on any failure (no .git,
-    non-github origin, etc.). Suppresses the discovery errors so the caller
-    can quietly fall back to user-mode.
+    Returns `(target, metadata, parent_full_name)` on success, None on any
+    failure (no .git, non-github origin, etc.). Suppresses the discovery
+    errors so the caller can quietly fall back to user-mode. The third
+    tuple element is the upstream `owner/name` when the resolved repo is
+    a fork, else `None`.
     """
     try:
         return discover_repo(gh, start_path=start_path)
