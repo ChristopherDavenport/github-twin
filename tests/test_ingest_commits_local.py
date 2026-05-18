@@ -39,7 +39,7 @@ def _patch_commits_clone(monkeypatch, repo_full: str, fixture_path: Path, head_s
     from github_twin.ingest import commits as commits_mod
 
     @contextmanager
-    def fake(full_name, *, cache_dir, token=None):
+    def fake(full_name, *, cache_dir, token=None, shallow_since=None):
         yield ClonedRepo(
             full_name=full_name,
             path=fixture_path,
@@ -56,12 +56,22 @@ class FakeGH:
     `paginate(/search/commits, ...)` is used for user-mode repo discovery; it
     returns whatever we hand in. `gh` is also passed to the identity resolver
     in org mode — there `/search/commits` should not be called when the email
-    is a noreply (resolved locally) or already cached.
+    is a noreply (resolved locally) or already cached. `get_json(/repos/...)`
+    backs the org-mode fast-skip pre-check; default returns no pushed_at so
+    repos always walk (preserving pre-fast-skip test behaviour).
     """
 
-    def __init__(self, repo_search_results=None, login_search_results=None):
+    token = "fake-token"
+
+    def __init__(
+        self,
+        repo_search_results=None,
+        login_search_results=None,
+        repo_info: dict[str, dict] | None = None,
+    ):
         self.repo_search_results = repo_search_results or []
         self.login_search_results = login_search_results or {}
+        self.repo_info = repo_info or {}
         self.calls: list[tuple[str, dict]] = []
 
     def paginate(self, path: str, *, params: dict | None = None):
@@ -76,6 +86,13 @@ class FakeGH:
                         return
                 return
             yield from self.repo_search_results
+
+    def get_json(self, path: str, *, params: dict | None = None):
+        self.calls.append((path, params or {}))
+        if path.startswith("/repos/"):
+            repo_full = path[len("/repos/") :]
+            return self.repo_info.get(repo_full, {})
+        return {}
 
 
 # ---------- user mode ----------
