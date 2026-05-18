@@ -332,7 +332,7 @@ def init(
         with GitHubClient() as gh:
             auto = maybe_discover_repo(gh)
             if auto is not None:
-                target, metadata = auto
+                target, metadata, _ = auto
                 with transaction(conn):
                     target = save_target(conn, target)
                     assert target.id is not None
@@ -385,7 +385,7 @@ def init(
     elif kind == "repo":
         with GitHubClient() as gh:
             try:
-                target, metadata = discover_repo(gh, repo=repo)
+                target, metadata, _ = discover_repo(gh, repo=repo)
             except ValueError as exc:
                 console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(2) from None
