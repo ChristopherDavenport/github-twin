@@ -15,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from github_twin._logging import cap_noisy_loggers, install_secret_redaction
-from github_twin.config import Config, EmbedCfg, load_config
+from github_twin.config import (
+    Config,
+    EmbedCfg,
+    config_path_for,
+    load_config,
+    resolve_data_dir,
+    resolved_clones_dir,
+)
 from github_twin.distill.rules import distill_rules
 from github_twin.distill.synth import CODE_SYSTEM_PROMPT, SYSTEM_PROMPT, make_synthesizer
 from github_twin.embed import Embedder, make_embedder
@@ -89,6 +96,33 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(name)s | %(message)s")
     cap_noisy_loggers()
     install_secret_redaction()
+
+
+def _warn_legacy_cwd_paths() -> None:
+    """Heads-up if files from the old (cwd-relative) layout are sitting in the
+    current directory but the resolved data_dir is elsewhere. One WARN per
+    invocation; no auto-move (silent moves are scarier than the warning).
+    """
+    data_dir = resolve_data_dir()
+    stray_cfg = Path.cwd() / "config.toml"
+    if stray_cfg.is_file() and not (data_dir / "config.toml").exists():
+        log.warning(
+            "Found legacy ./config.toml in cwd but %s does not exist. "
+            "Config now lives next to the DB. Move it with: "
+            "mkdir -p %s && mv %s %s",
+            data_dir / "config.toml",
+            data_dir,
+            stray_cfg,
+            data_dir / "config.toml",
+        )
+    stray_db = Path.cwd() / "data" / "db.sqlite"
+    if stray_db.is_file() and stray_db.parent.resolve() != data_dir.resolve():
+        log.warning(
+            "Found legacy ./data/db.sqlite in cwd but resolved data_dir is %s. "
+            "Set GT_PATHS__DATA_DIR=%s if you want to keep using this DB.",
+            data_dir,
+            stray_db.parent,
+        )
 
 
 def _ctx(config_path: Path | None) -> tuple[Config, sqlite3.Connection]:
@@ -184,6 +218,17 @@ def _report(msg: str) -> None:
     console.print(msg)
 
 
+def _print_locations(cfg: Config, config_override: Path | None) -> None:
+    """Show user-facing paths at the end of `gt init`."""
+    config_path = (
+        config_override if config_override is not None else config_path_for(cfg.paths.data_dir)
+    )
+    console.print()
+    console.print(f"Data dir: [bold]{cfg.paths.data_dir}[/bold]")
+    console.print(f"Config:   {config_path}")
+    console.print(f"DB:       {cfg.paths.db_path}")
+
+
 def _run_ingest_safely(
     cfg: Config,
     conn: sqlite3.Connection,
@@ -220,6 +265,7 @@ def main(
 ) -> None:
     _setup_logging(verbose)
     init_otel()
+    _warn_legacy_cwd_paths()
 
 
 @app.command()
@@ -272,7 +318,8 @@ def init(
         resolved_backend, resolved_model, resolved_dim = _resolve_embed_defaults(
             embed_backend, embed_model, embed_dim
         )
-        target_config = config if config is not None else Path("config.toml")
+        target_config = config if config is not None else config_path_for()
+        target_config.parent.mkdir(parents=True, exist_ok=True)
         _persist_embed_config(target_config, resolved_backend, resolved_model, resolved_dim)
         console.print(
             f"[dim]Embed config written to {target_config}: "
@@ -295,7 +342,7 @@ def init(
                     f"(id {target.external_id}) [dim](auto-detected)[/dim]"
                 )
                 console.print(f"Default branch: {metadata['default_branch']}")
-                console.print(f"\nDB: {cfg.paths.db_path}")
+                _print_locations(cfg, config)
                 return
         kind = "user"
         console.print("[dim]No github.com .git found; falling back to user mode.[/dim]")
@@ -351,7 +398,7 @@ def init(
     else:
         console.print(f"[red]Unknown --kind: {kind!r}. Expected 'user', 'org', or 'repo'.[/red]")
         raise typer.Exit(2)
-    console.print(f"\nDB: {cfg.paths.db_path}")
+    _print_locations(cfg, config)
 
 
 @app.command("init-claude-md")
@@ -916,6 +963,201 @@ def stats(
         )
 
 
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n = int(n / 1024)
+    return f"{n} B"
+
+
+def _print_pipeline_state(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    target_rows: list[tuple[str, str, int]],
+) -> None:
+    """`gt status --full` extension: embed / summarize / ingest cursors.
+
+    Uses `chunk.embed_model IS NOT NULL` as the embedded-count proxy so
+    we don't need the sqlite-vec extension loaded just for diagnostics.
+    """
+    from github_twin.pipeline import _EMBED_VERSION_KEY, EMBED_TEXT_VERSION
+
+    console.print("\n[bold]Pipeline[/bold]")
+
+    # --- Embed coverage ---
+    total = conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
+    embedded = conn.execute("SELECT COUNT(*) FROM chunk WHERE embed_model IS NOT NULL").fetchone()[
+        0
+    ]
+    pending = total - embedded
+    pct = (embedded * 100.0 / total) if total else 0.0
+    console.print(f"  Embed:     {embedded}/{total} ({pct:.1f}%)  [dim]pending {pending}[/dim]")
+    row = conn.execute(
+        "SELECT cursor FROM sync_cursor WHERE target_id=0 AND resource=?",
+        (_EMBED_VERSION_KEY,),
+    ).fetchone()
+    stored_version = int(row["cursor"]) if row else None
+    version_note = ""
+    if stored_version is None:
+        version_note = "[dim](never run)[/dim]"
+    elif stored_version != EMBED_TEXT_VERSION:
+        version_note = (
+            f"[yellow](stale: stored={stored_version} current={EMBED_TEXT_VERSION}; "
+            f"next `gt embed` will wipe + re-embed)[/yellow]"
+        )
+    else:
+        version_note = f"[dim](v{stored_version})[/dim]"
+    console.print(f"             text_version: {version_note}")
+
+    # --- Summarize coverage, per kind ---
+    kinds = list(cfg.summarize.kinds)
+    if kinds:
+        placeholders = ",".join("?" * len(kinds))
+        rows = conn.execute(
+            f"SELECT kind, COUNT(*) AS total, "
+            f"SUM(CASE WHEN summary IS NOT NULL THEN 1 ELSE 0 END) AS done "
+            f"FROM chunk WHERE kind IN ({placeholders}) GROUP BY kind",
+            kinds,
+        ).fetchall()
+        by_kind = {r["kind"]: (r["done"] or 0, r["total"]) for r in rows}
+        console.print("  Summarize:")
+        for k in kinds:
+            done, tot = by_kind.get(k, (0, 0))
+            if tot == 0:
+                console.print(f"    {k:<16} [dim]no chunks[/dim]")
+            else:
+                kpct = done * 100.0 / tot
+                console.print(
+                    f"    {k:<16} {done}/{tot} ({kpct:.1f}%)  [dim]pending {tot - done}[/dim]"
+                )
+
+    # --- Per-target ingest cursors ---
+    console.print("  Ingest cursors:")
+    for kind, name, tid in target_rows:
+        repos = conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "SUM(CASE WHEN last_commits_at IS NOT NULL THEN 1 ELSE 0 END) AS c, "
+            "SUM(CASE WHEN last_files_at   IS NOT NULL THEN 1 ELSE 0 END) AS f, "
+            "SUM(CASE WHEN last_reviews_at IS NOT NULL THEN 1 ELSE 0 END) AS r "
+            "FROM repo WHERE target_id=?",
+            (tid,),
+        ).fetchone()
+        n = repos["n"] or 0
+        if n == 0:
+            console.print(f"    [dim]{kind} {name}: no repos discovered[/dim]")
+            continue
+        console.print(
+            f"    {kind} {name}: {n} repos · "
+            f"commits {repos['c'] or 0}/{n} · "
+            f"files {repos['f'] or 0}/{n} · "
+            f"reviews {repos['r'] or 0}/{n}"
+        )
+
+
+@app.command()
+def status(
+    config: Path | None = typer.Option(None, "--config"),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Add a pipeline-state section: embed / summarize coverage and per-target cursors.",
+    ),
+) -> None:
+    """Show where files live and what backends are wired up.
+
+    Side-effect-free: does NOT create the DB. Use this to diagnose
+    "where did my data go?" before running anything destructive.
+    Pass `--full` for embed / summarize / ingest coverage too.
+    """
+    from github_twin.ingest import auth_storage
+
+    cfg = load_config(config)
+    data_dir = cfg.paths.data_dir
+    cfg_path = config if config is not None else config_path_for(data_dir)
+    db_path = cfg.paths.db_path
+    clones_path = resolved_clones_dir(cfg)
+
+    def _mark(p: Path) -> str:
+        if not p.exists():
+            return "[dim](not created yet)[/dim]"
+        if p.is_file():
+            return f"[dim]({_human_bytes(p.stat().st_size)})[/dim]"
+        return "[dim](exists)[/dim]"
+
+    console.print("[bold]Paths[/bold]")
+    console.print(f"  Data dir: {data_dir} {_mark(data_dir)}")
+    console.print(f"  Config:   {cfg_path} {_mark(cfg_path)}")
+    console.print(f"  DB:       {db_path} {_mark(db_path)}")
+    console.print(f"  Clones:   {clones_path} {_mark(clones_path)}")
+
+    console.print("\n[bold]Backends[/bold]")
+    console.print(f"  Embed:    {cfg.embed.backend} / {cfg.embed.model} / {cfg.embed.dim}-dim")
+    console.print(f"  Vector:   {cfg.vector_store.backend}")
+    console.print(f"  BM25 exp: {cfg.retrieval.query_expansion}")
+    console.print(f"  Distill:  {cfg.distill.backend}")
+    console.print(f"  Summarize:{cfg.summarize.backend}")
+
+    console.print("\n[bold]Targets[/bold]")
+    target_rows: list[tuple[str, str, int]] = []
+    if not db_path.exists():
+        console.print("  [yellow]No DB yet. Run `gt init` to add a target.[/yellow]")
+    else:
+        # Open the existing file directly — open_db() would CREATE the schema
+        # if the file existed but was empty, which we want to avoid here.
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            try:
+                target_rows = [
+                    (r["kind"], r["name"], r["id"])
+                    for r in conn.execute(
+                        "SELECT kind, name, id FROM target ORDER BY id"
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError:
+                target_rows = []
+            if not target_rows:
+                console.print("  [yellow]No targets in DB. Run `gt init`.[/yellow]")
+            else:
+                for kind, name, tid in target_rows:
+                    console.print(f"  - {kind:<5} {name} [dim](id {tid})[/dim]")
+            if full and target_rows:
+                _print_pipeline_state(conn, cfg, target_rows)
+        finally:
+            conn.close()
+
+    console.print("\n[bold]Auth[/bold]")
+    persisted = auth_storage.describe_source()
+    if persisted is not None:
+        details = f"{persisted.kind} · {persisted.location}"
+        if persisted.login:
+            details += f" · login={persisted.login}"
+        console.print(f"  Persisted: ✓ {details}")
+    else:
+        console.print("  Persisted: — [dim](run `gt auth login`)[/dim]")
+    if os.environ.get("GITHUB_TOKEN"):
+        console.print("  GITHUB_TOKEN env: ✓")
+
+    # Re-detect legacy cwd paths so the user sees them on stdout even if the
+    # startup WARN was missed (it goes to the logging handler, not console).
+    cwd_cfg = Path.cwd() / "config.toml"
+    cwd_db = Path.cwd() / "data" / "db.sqlite"
+    legacy: list[str] = []
+    if cwd_cfg.is_file() and not (data_dir / "config.toml").exists():
+        legacy.append(f"./config.toml exists in cwd but {data_dir / 'config.toml'} does not")
+    if cwd_db.is_file() and cwd_db.parent.resolve() != data_dir.resolve():
+        legacy.append(f"./data/db.sqlite exists in cwd but resolved data_dir is {data_dir}")
+    if legacy:
+        console.print("\n[bold yellow]Legacy paths detected[/bold yellow]")
+        for item in legacy:
+            console.print(f"  • {item}")
+        console.print(
+            "  [dim]These were from the pre-fix layout. Move them under data_dir "
+            "(see `gt status` warnings logged at startup).[/dim]"
+        )
+
+
 @app.command()
 def repos(
     target: str | None = typer.Option(
@@ -1089,7 +1331,7 @@ def clones_prune(
     cfg, conn = _ctx(config)
     keep = q.all_cached_repos(conn)
     decisions = prune_cache(
-        cfg.ingest.clones_dir,
+        resolved_clones_dir(cfg),
         keep=keep,
         older_than_days=older_than_days,
         dry_run=dry_run,

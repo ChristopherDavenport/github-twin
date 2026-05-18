@@ -137,10 +137,15 @@ Emails discovered:
   • old-work@other-employer.com           ← surfaced by the historical sweep
   • yourusername@users.noreply.github.com
 
-DB: data/db.sqlite
+Data dir: ~/.local/share/github-twin
+Config:   ~/.local/share/github-twin/config.toml
+DB:       ~/.local/share/github-twin/db.sqlite
 ```
 
-Review the list. If anything looks wrong, edit `config.toml`:
+(Override with `GT_PATHS__DATA_DIR=...` — everything per-DB lives under
+that root.)
+
+Review the list. If anything looks wrong, edit `<data_dir>/config.toml`:
 
 ```toml
 [identity]
@@ -231,7 +236,7 @@ Force one with `gt distill --backend claude|gemini|ollama`.
 ### Quality expectations
 
 - **Claude or Gemini**: rules are coherent, language-aware, and faithful to the underlying comments. ~10–25¢ on Claude with prompt caching; free under the Gemini Flash daily quota.
-- **Ollama `llama3.2:3B`**: works, but expect 10–20% of rules to be artifacts — placeholder text leaking from the system prompt, invented language tags, or vague platitudes. Pull `qwen2.5-coder:14b` or similar and set `distill.ollama_model` in `config.toml` for noticeably better results.
+- **Ollama `llama3.2:3B`**: works, but expect 10–20% of rules to be artifacts — placeholder text leaking from the system prompt, invented language tags, or vague platitudes. Pull `qwen2.5-coder:14b` or similar and set `distill.ollama_model` in `<data_dir>/config.toml` for noticeably better results.
 
 Re-running with a different backend overwrites the same rule artifacts in place (they're keyed by a hash of cluster-member IDs), so you can A/B backends without artifact churn.
 
@@ -337,12 +342,14 @@ deletes it before moving on**. Peak disk usage is roughly the largest single
 repo. That's safe on tight disks but means a re-sync re-clones every repo.
 
 To keep clones around and update them with `git fetch --depth 1` on later
-syncs, set in `config.toml`:
+syncs, set in `<data_dir>/config.toml`:
 
 ```toml
 [ingest]
 cache_clones    = true
-clones_dir      = "./data/clones"
+# Omit clones_dir to keep clones under <data_dir>/clones (recommended).
+# Set it only when you want clones on a different disk than the DB.
+# clones_dir    = "/mnt/big-disk/github-twin/clones"
 max_repo_size_kb = 500000   # skip repos larger than this (default 500 MB)
 ```
 

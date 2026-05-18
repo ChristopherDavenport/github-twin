@@ -14,7 +14,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 
-from github_twin.config import Config
+from github_twin.config import Config, resolved_clones_dir
 from github_twin.embed import Embedder, make_embedder
 from github_twin.embed.prefix import prefix_chunk
 from github_twin.eval.llm import TextLLM, make_text_llm
@@ -88,6 +88,11 @@ def run_ingest(
     targets = _resolve_targets(conn, target)
     if not targets:
         raise IdentityMissingError("No targets. Run `gt init` first.")
+    # Resolve clones_dir against data_dir once, here, so every ingest
+    # function downstream sees a concrete Path instead of None.
+    cfg = cfg.model_copy(
+        update={"ingest": cfg.ingest.model_copy(update={"clones_dir": resolved_clones_dir(cfg)})}
+    )
     aggregate: dict[str, object] = {}
     for t in targets:
         assert t.id is not None

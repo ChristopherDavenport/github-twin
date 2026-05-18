@@ -136,7 +136,8 @@ Restart Claude Code; the `find_*`, `predict_review_outcome`,
 
 ## Quickstart
 
-Pick a directory to hold the SQLite DB and ingested cache:
+Pick a directory to hold the SQLite DB, config, and ingested cache —
+everything per-data-dir lives under this one root:
 
 ```sh
 export GT_PATHS__DATA_DIR=~/github-twin-data
@@ -147,13 +148,22 @@ uvx github-twin init                       # discover identity via /user
 uvx github-twin sync                       # ingest + summarize + embed
 uvx github-twin serve                      # MCP server over stdio
 
-# org mode (whole org)
+# layer an org into the SAME DB
+uvx github-twin init --kind org --org http4s
+uvx github-twin sync
+
+# OR keep the org in its own DB by switching data dirs
 GT_PATHS__DATA_DIR=~/twin-http4s \
   uvx github-twin init --kind org --org http4s
 GT_PATHS__DATA_DIR=~/twin-http4s uvx github-twin sync
 ```
 
 `gt sync` is incremental on subsequent runs.
+
+`config.toml` lives next to the DB at `<data_dir>/config.toml` and is
+created on the first `gt init --embed-backend ...` call. Default
+`<data_dir>` is `$XDG_DATA_HOME/github-twin` (or `~/.local/share/github-twin`)
+when `GT_PATHS__DATA_DIR` is unset.
 
 ## LLM provider matrix
 
@@ -203,7 +213,8 @@ We keep the embedder backend separate from the LLM backend. Choose one:
 
 The embedder is a per-DB commitment — `sqlite-vec` bakes the vector
 dimension into the table at first creation. Stamp the choice into
-`config.toml` at init time so every subsequent command picks it up:
+`<data_dir>/config.toml` at init time so every subsequent command
+picks it up:
 
 ```sh
 gt init --embed-backend gemini                              # gemini-embedding-001, 3072
@@ -298,8 +309,9 @@ Use `github-twin <command>` interchangeably with `gt <command>`.
 | Vector store (`cfg.vector_store.backend`) | — | `sqlite-vec` (brute-force KNN) | `faiss` via `[faiss]` extra |
 | BM25 query expansion (`cfg.retrieval.query_expansion`) | — | `rule` (deterministic) | `ollama` (LLM, cached) or `off` |
 
-All settings are layered: defaults → `config.toml` in CWD → env vars
-prefixed `GT_` (nested via `__`, e.g. `GT_EMBED__BACKEND=sentence_transformers`).
+All settings are layered: defaults → `<data_dir>/config.toml` (or the
+explicit `--config PATH`) → env vars prefixed `GT_` (nested via `__`,
+e.g. `GT_EMBED__BACKEND=sentence_transformers`).
 
 ## Held-out evaluation
 
@@ -390,27 +402,32 @@ the `[otel]` extra and the SDK picks it up automatically based on
 
 ## Storage
 
-Each target gets its own SQLite DB. The default location follows the
-[XDG Base Directory spec](https://specifications.freedesktop.org/basedir-spec/latest/):
+One DB can hold many targets (user + N orgs + N repos); use a separate
+`GT_PATHS__DATA_DIR` per DB when you want them isolated. The resolved
+data dir is pure with respect to env:
 
-- `$XDG_DATA_HOME/github-twin/` when `XDG_DATA_HOME` is set
-- `~/.local/share/github-twin/` otherwise
-- **Backward-compat:** if a `./data` directory exists in the current
-  working directory, that wins instead. Pre-XDG installs keep working.
+- `GT_PATHS__DATA_DIR` when set
+- else `$XDG_DATA_HOME/github-twin/` when `XDG_DATA_HOME` is set
+- else `~/.local/share/github-twin/`
 
-Layout:
+The current working directory is never consulted.
+
+Layout — everything per-DB lives under one root:
 
 ```
 <data_dir>/
   db.sqlite                  # artifacts + chunks + vectors + FTS5 index
+  config.toml                # written by `gt init --embed-backend ...`
   raw/                       # on-disk cache of raw GitHub responses
   clones/                    # persistent shallow clones (if cache_clones=true)
+  wiki/                      # `gt wiki export` default output
+  auth/token.json            # OAuth file fallback
   query_expansion_cache.sqlite  # only when retrieval.query_expansion=ollama
 ```
 
-Override per-target via `GT_PATHS__DATA_DIR` — switching from user mode
-to org mode is just changing this env var to point at a different
-directory.
+If you ran an older release that wrote `./config.toml` or `./data/` into
+the current working directory, every CLI invocation logs a one-time WARN
+with the exact `mv` command to migrate.
 
 ## Releasing
 

@@ -145,8 +145,11 @@ def test_gt_init_writes_embed_config_and_opens_db_with_chosen_dim(
     )
     assert result.exit_code == 0, result.output
 
-    cfg_path = tmp_path / "config.toml"
+    # config.toml lives next to the DB, inside the resolved data_dir.
+    cfg_path = tmp_path / "data" / "config.toml"
     assert cfg_path.exists()
+    # A stray ./config.toml MUST NOT have been written in cwd.
+    assert not (tmp_path / "config.toml").exists()
     data = tomllib.loads(cfg_path.read_text())
     assert data["embed"] == {
         "backend": "gemini",
@@ -172,3 +175,57 @@ def test_gt_init_writes_embed_config_and_opens_db_with_chosen_dim(
     finally:
         conn.close()
     assert row is not None and "FLOAT[3072]" in row[0]
+
+
+def test_gt_init_user_then_org_layer_into_one_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two `gt init` calls in the same cwd (user, then org) should layer
+    BOTH targets into one DB sitting at the resolved data_dir. This is
+    the bug the consistency fix was designed for — pre-fix, the two
+    inits ended up at different paths (config in cwd, data in XDG)."""
+    from github_twin.target import Target
+
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    data_dir = tmp_path / "twin-data"
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("GT_PATHS__DATA_DIR", str(data_dir))
+
+    class _FakeGH:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("github_twin.cli.GitHubClient", _FakeGH)
+    monkeypatch.setattr(
+        "github_twin.cli.discover_user",
+        lambda gh, identity: Target(kind="user", name="alice", external_id=42, emails=[]),
+    )
+    monkeypatch.setattr(
+        "github_twin.cli.discover_org",
+        lambda gh, org: Target(kind="org", name=org, external_id=99, emails=[]),
+    )
+    monkeypatch.setattr("github_twin.cli.enumerate_org_repos", lambda *a, **kw: iter([]))
+
+    runner = CliRunner()
+    r1 = runner.invoke(app, ["init", "--kind", "user"])
+    assert r1.exit_code == 0, r1.output
+    r2 = runner.invoke(app, ["init", "--kind", "org", "--org", "http4s"])
+    assert r2.exit_code == 0, r2.output
+
+    # One DB in the resolved data_dir, holding both target rows.
+    db_path = data_dir / "db.sqlite"
+    assert db_path.exists()
+    # No DB or config leaked into cwd.
+    assert not (cwd / "config.toml").exists()
+    assert not (cwd / "data").exists()
+
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT kind, name FROM target ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("user", "alice"), ("org", "http4s")]
