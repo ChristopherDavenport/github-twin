@@ -72,15 +72,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # Resolve the latest mcp-publisher release at workflow time. The
           # binary is published as a tarball under the
           # modelcontextprotocol/registry repo's releases. If the registry
           # ever introduces a breaking schema change, pin a tag here.
           tag=$(gh release view --repo modelcontextprotocol/registry --json tagName --jq .tagName)
-          version="${tag#v}"
-          echo "Installing mcp-publisher ${version}"
+          echo "Installing mcp-publisher ${tag}"
           curl --silent --fail --location \
-            "https://github.com/modelcontextprotocol/registry/releases/download/${tag}/mcp-publisher_${version}_linux_amd64.tar.gz" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${tag}/mcp-publisher_linux_amd64.tar.gz" \
             | tar --extract --gzip --directory /usr/local/bin mcp-publisher
           mcp-publisher --version
 
