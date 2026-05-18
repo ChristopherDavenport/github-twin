@@ -359,18 +359,19 @@ def upsert_artifact(
     decision: str | None,
     meta: dict[str, Any] | None,
     author_login: str | None = None,
+    content_hash: str | None = None,
 ) -> int:
     """Insert or update an artifact keyed by (target_id, kind, external_id).
     Returns artifact id."""
     cur = conn.execute(
         "INSERT INTO artifact (target_id, kind, external_id, source_url, repo, language, "
-        "author_email, author_login, created_at, decision, meta_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "author_email, author_login, created_at, decision, meta_json, content_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id, kind, external_id) DO UPDATE SET "
         "source_url=excluded.source_url, repo=excluded.repo, language=excluded.language, "
         "author_email=excluded.author_email, author_login=excluded.author_login, "
         "created_at=excluded.created_at, decision=excluded.decision, "
-        "meta_json=excluded.meta_json "
+        "meta_json=excluded.meta_json, content_hash=excluded.content_hash "
         "RETURNING id",
         (
             target_id,
@@ -384,10 +385,73 @@ def upsert_artifact(
             created_at,
             decision,
             _json_or_none(meta),
+            content_hash,
         ),
     )
     row_id: int = cur.fetchone()["id"]
     return row_id
+
+
+def get_artifact_content_hash(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    kind: str,
+    external_id: str,
+) -> tuple[int | None, str | None]:
+    """Look up (artifact_id, content_hash) for an existing artifact.
+
+    Returns (None, None) when the artifact doesn't exist yet, and
+    (id, None) for pre-content-hash rows. Callers use the hash to short-
+    circuit chunk wipe+re-insert when the source content is unchanged.
+    """
+    row = conn.execute(
+        "SELECT id, content_hash FROM artifact "
+        "WHERE target_id = ? AND kind = ? AND external_id = ?",
+        (target_id, kind, external_id),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["id"], row["content_hash"]
+
+
+def update_artifact_metadata(
+    conn: sqlite3.Connection,
+    *,
+    artifact_id: int,
+    author_login: str | None = None,
+    created_at: str | None = None,
+    meta: dict[str, Any] | None = None,
+    content_hash: str | None = None,
+    source_url: str | None = None,
+) -> None:
+    """Light update of artifact metadata WITHOUT touching its chunks.
+
+    Used on the content-hash skip path: the diff/body hasn't changed, but
+    we may have newly resolved an author_login or want to bump content_hash
+    onto a legacy row. Passing None for a field leaves it unchanged.
+    """
+    sets: list[str] = []
+    params: list[Any] = []
+    if author_login is not None:
+        sets.append("author_login = ?")
+        params.append(author_login)
+    if created_at is not None:
+        sets.append("created_at = ?")
+        params.append(created_at)
+    if meta is not None:
+        sets.append("meta_json = ?")
+        params.append(_json_or_none(meta))
+    if content_hash is not None:
+        sets.append("content_hash = ?")
+        params.append(content_hash)
+    if source_url is not None:
+        sets.append("source_url = ?")
+        params.append(source_url)
+    if not sets:
+        return
+    params.append(artifact_id)
+    conn.execute(f"UPDATE artifact SET {', '.join(sets)} WHERE id = ?", params)
 
 
 def list_rules(
