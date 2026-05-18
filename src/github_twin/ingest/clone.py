@@ -50,13 +50,21 @@ class ClonedRepo:
 
 
 def _git(args: list[str], *, cwd: Path | None = None) -> str:
-    """Run git, return stdout (stripped). Raise CloneError on non-zero exit."""
+    """Run git, return stdout (stripped). Raise CloneError on non-zero exit.
+
+    `errors="replace"` because `git show` of a diff can include bytes that
+    aren't valid UTF-8 (source files in legacy encodings, binary patch
+    fragments inside hunks). The diff text is downstream-chunked and
+    embedded; substituting U+FFFD for undecodable bytes is preferable to
+    aborting an entire repo's commit walk.
+    """
     try:
         out = subprocess.run(
             ["git", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
