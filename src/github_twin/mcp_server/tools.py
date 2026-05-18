@@ -522,9 +522,11 @@ def _resolve_scope(
     """Translate scope + target into `(target_id, repo, author_login)`.
 
     - `scope="personal"` resolves the unique user-mode target and fills
-      both `target_id` (so coalesce-mode dedup doesn't reintroduce org-side
-      copies of the user's own commits) and `author_login` (sugar over the
-      author_login column).
+      `target_id` (so coalesce-mode dedup doesn't reintroduce org-side
+      copies of the user's own commits). `author_login` is NOT filled
+      from the user-mode target: user-mode ingest leaves
+      `artifact.author_login = NULL` by design, so the filter would
+      zero every result out. `target_id` alone narrows correctly.
     - `scope="project"` resolves the unique repo-mode target and fills
       `target_id` + `repo`.
     - `scope="all"` is a no-op pass-through.
@@ -539,11 +541,12 @@ def _resolve_scope(
             t = load_target(conn, kind="user")
         except AmbiguousTargetError as exc:
             raise ValueError(f"scope='personal' is ambiguous: {exc}") from None
-        if t is not None and t.id is not None:
-            if target_id is None:
-                target_id = t.id
-            if author_login is None:
-                author_login = t.name
+        # User-mode ingest leaves artifact.author_login = NULL
+        # (ingest_commits resolve_author_login=False), so we deliberately
+        # do NOT fill author_login from t.name here — that would zero out
+        # every result. target_id alone narrows correctly.
+        if t is not None and t.id is not None and target_id is None:
+            target_id = t.id
     elif scope == "project":
         try:
             t = load_target(conn, kind="repo")

@@ -46,13 +46,17 @@ def test_scope_all_passes_through(conn):
 # ---------- "personal" ----------
 
 
-def test_scope_personal_fills_author_and_target_in_user_mode(conn):
+def test_scope_personal_fills_only_target_in_user_mode(conn):
+    """User-mode rows have author_login=NULL by design, so personal-scope
+    must NOT fill author_login from the target name or every result would
+    be zeroed out. target_id alone narrows correctly. Pins issue #13.
+    """
     user = _seed_target(conn, kind="user", name="alice")
     tid, repo, author = _resolve_scope(
         conn, scope="personal", target=None, repo=None, author_login=None
     )
     assert repo is None
-    assert author == "alice"
+    assert author is None
     assert tid == user.id
 
 

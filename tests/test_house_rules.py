@@ -239,10 +239,18 @@ def test_author_login_filter_restricts_to_one_author(conn):
     assert "bob-rule" not in md
 
 
-def test_scope_personal_fills_author_login_from_user_target(conn):
-    """`scope="personal"` in a user-mode target should restrict to that
-    user's rules without the caller naming the login explicitly."""
+def test_scope_personal_does_not_filter_author_login_in_user_mode(conn):
+    """Regression test for issue #13.
+
+    User-mode ingest leaves `artifact.author_login = NULL` by design, so
+    `scope="personal"` must NOT derive an author_login filter from the
+    user-mode target's name — doing so would zero out every result against
+    a real user-mode corpus. target_id alone narrows correctly.
+    """
     # The conftest fixture seeded a user-mode target named 'me'.
+    # Both seeded rules sit under target_id=1; in a real user-mode DB
+    # author_login would be NULL, but we seed it here to prove the fix
+    # doesn't accidentally re-introduce an author_login filter.
     _seed_rule(
         conn,
         text="me-rule",
@@ -261,9 +269,9 @@ def test_scope_personal_fills_author_login_from_user_target(conn):
     )
     out = house_rules(conn, scope="personal")
     md = out["markdown"]
-    assert out["review_rules"] == 1
+    assert out["review_rules"] == 2
     assert "me-rule" in md
-    assert "bob-rule" not in md
+    assert "bob-rule" in md
 
 
 def test_explicit_kwargs_win_over_scope(conn):
