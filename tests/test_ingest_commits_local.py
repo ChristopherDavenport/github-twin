@@ -218,6 +218,57 @@ def test_user_mode_incremental_walk_skips_already_seen(conn, monkeypatch, tmp_gi
     assert conn.execute("SELECT COUNT(*) FROM artifact WHERE kind='commit'").fetchone()[0] == 2
 
 
+def test_user_mode_fast_skips_unchanged_repos(conn, monkeypatch, tmp_git_repo):
+    """Second sync skips the clone entirely when `/repos/{r}` reports a
+    `pushed_at` no newer than the stored `last_commits_at` cursor.
+
+    Mirrors `_needs_walk` behavior — port from org-mode."""
+    tmp_git_repo.make_commit(
+        path="a.py",
+        content="x=1\n",
+        message="first",
+        author_email="me@example.com",
+        date="2024-01-02T00:00:00+00:00",
+    )
+    _patch_commits_clone(monkeypatch, "me/proj", tmp_git_repo.path, tmp_git_repo.head_sha)
+    # `pushed_at` is in the past relative to the cursor we'll stamp ("now").
+    gh = FakeGH(
+        repo_search_results=[{"repository": {"full_name": "me/proj"}}],
+        repo_info={"me/proj": {"pushed_at": "2020-01-01T00:00:00Z"}},
+    )
+    cfg = IngestCfg(since="2020-01-01")
+    ingest_commits(
+        conn=conn,
+        gh=gh,
+        cache=RawCache(tmp_git_repo.path / "raw"),
+        username="me",
+        emails=["me@example.com"],
+        cfg=cfg,
+        target_id=1,
+    )
+    first_count = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
+    assert first_count == 1
+
+    # Second pass: monkeypatch `commits_clone` to explode so any attempted
+    # clone would fail the test. With fast-skip wired up, no clone happens.
+    from github_twin.ingest import commits as commits_mod
+
+    def boom(*_a, **_kw):
+        raise AssertionError("fast-skip failed — repo was cloned")
+
+    monkeypatch.setattr(commits_mod, "commits_clone", boom)
+    ingest_commits(
+        conn=conn,
+        gh=gh,
+        cache=RawCache(tmp_git_repo.path / "raw"),
+        username="me",
+        emails=["me@example.com"],
+        cfg=cfg,
+        target_id=1,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0] == first_count
+
+
 # ---------- org mode ----------
 
 
