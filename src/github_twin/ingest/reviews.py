@@ -97,197 +97,85 @@ def ingest_reviews(
     since: str | None = None,
     limit_prs: int | None = None,
 ) -> ReviewStats:
+    """Parallel user-mode reviews walk.
+
+    Discovery is one `/search/issues` pass (kept serial — it's already
+    one call with pagination). For each discovered PR, a worker pool
+    fetches the three sub-endpoints (`/pulls/{n}/comments`,
+    `/pulls/{n}/reviews`, `/issues/{n}/comments`) in parallel. Completed
+    payloads are written on the main thread, each PR in its own
+    transaction so partial failures don't roll back peers.
+
+    Artifact storage mirrors org-mode (`content_hash` + `author_login`)
+    so re-syncs can fast-skip unchanged comments via
+    `_ingest_one_pr`'s content-hash short-circuit. `keep_only_login`
+    filters comments to the target user and stamps the PR-level
+    `decision` from the user's review state — preserving the
+    `predict_review_outcome` contract."""
     cursor = since or q.get_cursor(conn, "reviews", target_id=target_id) or cfg.since
     log.info("ingesting reviews since %s", cursor)
     stats = ReviewStats()
-    newest_updated: str | None = None
 
     prs = list(_iter_my_prs(gh, username=username, since=cursor))
     if limit_prs:
         prs = prs[:limit_prs]
 
+    filtered: list[tuple[str, dict[str, Any]]] = []
+    newest_updated: str | None = None
     for item in prs:
         rn = _repo_and_number(item)
         if rn is None:
             stats.skipped += 1
             continue
-        repo_full, pr_number = rn
-
+        repo_full, _ = rn
         if cfg.exclude_repos and any(_match(repo_full, pat) for pat in cfg.exclude_repos):
             stats.skipped += 1
             continue
         if cfg.include_repos and not any(_match(repo_full, pat) for pat in cfg.include_repos):
             stats.skipped += 1
             continue
-
         updated = item.get("updated_at")
         if updated and (newest_updated is None or updated > newest_updated):
             newest_updated = updated
+        filtered.append((repo_full, item))
 
-        pr_title = item.get("title") or ""
-        cache_key = f"{repo_full}__{pr_number}"
+    log.info(
+        "user reviews: %d PRs to process (max %d workers)",
+        len(filtered),
+        cfg.repo_concurrency,
+    )
+    if not filtered:
+        return stats
 
-        # Pull review comments + my reviews + issue comments
-        try:
-            review_comments = list(
-                gh.paginate(
-                    f"/repos/{repo_full}/pulls/{pr_number}/comments",
-                    params={"per_page": 100},
+    workers = max(1, min(cfg.repo_concurrency, len(filtered)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-user-reviews") as pool:
+        futures = {
+            pool.submit(_fetch_pr_payload, gh, repo_full, pr_item): (repo_full, pr_item)
+            for repo_full, pr_item in filtered
+        }
+        for fut in as_completed(futures):
+            repo_full, pr_item = futures[fut]
+            try:
+                payload = fut.result()
+            except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
+                log.warning("worker %s#%s crashed: %s", repo_full, pr_item.get("number"), e)
+                stats.skipped += 1
+                continue
+            if payload is None:
+                stats.skipped += 1
+                continue
+            with transaction(conn):
+                _ingest_one_pr(
+                    conn=conn,
+                    gh=gh,
+                    cache=cache,
+                    target_id=target_id,
+                    repo_full=repo_full,
+                    pr_item=pr_item,
+                    stats=stats,
+                    payload=payload,
+                    keep_only_login=username,
                 )
-            )
-            my_reviews_all = list(
-                gh.paginate(
-                    f"/repos/{repo_full}/pulls/{pr_number}/reviews",
-                    params={"per_page": 100},
-                )
-            )
-            issue_comments = list(
-                gh.paginate(
-                    f"/repos/{repo_full}/issues/{pr_number}/comments",
-                    params={"per_page": 100},
-                )
-            )
-        except GitHubError as e:
-            log.warning("skip %s#%d: %s", repo_full, pr_number, e)
-            stats.skipped += 1
-            continue
-
-        cache.write_json(
-            "reviews",
-            cache_key,
-            {
-                "pr": item,
-                "review_comments": review_comments,
-                "reviews": my_reviews_all,
-                "issue_comments": issue_comments,
-            },
-        )
-
-        my_reviews = [r for r in my_reviews_all if (r.get("user") or {}).get("login") == username]
-        decision = _decision_from_reviews(my_reviews)
-
-        # PR-level artifact: stores the decision so predict_review_outcome
-        # can aggregate over similar past PRs at query time.
-        pr_artifact_id = q.upsert_artifact(
-            conn,
-            target_id=target_id,
-            kind="pr",
-            external_id=f"{repo_full}#{pr_number}",
-            source_url=item.get("html_url"),
-            repo=repo_full,
-            language=None,
-            author_email=None,
-            created_at=item.get("created_at"),
-            decision=decision,
-            meta={"title": pr_title, "state": item.get("state")},
-        )
-        # PR-summary chunk for vector retrieval (P3). Idempotent re-ingest:
-        # we drop any existing chunks for this PR artifact first.
-        q.delete_chunks_for_artifact(conn, pr_artifact_id)
-        summary = chunk_pr_summary(
-            title=pr_title,
-            body=item.get("body"),
-            repo=repo_full,
-            pr_number=pr_number,
-            source_url=item.get("html_url"),
-        )
-        if summary is not None:
-            q.insert_chunk(
-                conn,
-                artifact_id=pr_artifact_id,
-                kind="pr_summary",
-                text=summary.text,
-                context=summary.context,
-                language=None,
-            )
-
-        stats.prs_seen += 1
-
-        # Per-line review comments (have diff_hunk)
-        for rc in review_comments:
-            if (rc.get("user") or {}).get("login") != username:
-                continue
-            self_id = str(rc.get("id"))
-            path = rc.get("path") or ""
-            lang = language_for_path(path)
-            body = (rc.get("body") or "").strip()
-            if not body:
-                continue
-            diff_hunk = rc.get("diff_hunk") or ""
-
-            artifact_id = q.upsert_artifact(
-                conn,
-                target_id=target_id,
-                kind="review_comment",
-                external_id=self_id,
-                source_url=rc.get("html_url"),
-                repo=repo_full,
-                language=lang,
-                author_email=None,
-                created_at=rc.get("created_at"),
-                decision=None,
-                meta={
-                    "pr_number": pr_number,
-                    "pr_title": pr_title,
-                    "path": path,
-                },
-            )
-            q.delete_chunks_for_artifact(conn, artifact_id)
-            q.insert_chunk(
-                conn,
-                artifact_id=artifact_id,
-                kind="review_comment",
-                text=body,
-                context={
-                    "diff_hunk": diff_hunk,
-                    "path": path,
-                    "language": lang,
-                    "pr_title": pr_title,
-                    "pr_number": pr_number,
-                    "repo": repo_full,
-                    "url": rc.get("html_url"),
-                },
-                language=lang,
-            )
-            stats.review_comments += 1
-
-        # Issue-style PR comments (no diff_hunk)
-        for ic in issue_comments:
-            if (ic.get("user") or {}).get("login") != username:
-                continue
-            self_id = str(ic.get("id"))
-            body = (ic.get("body") or "").strip()
-            if not body:
-                continue
-            artifact_id = q.upsert_artifact(
-                conn,
-                target_id=target_id,
-                kind="issue_comment",
-                external_id=self_id,
-                source_url=ic.get("html_url"),
-                repo=repo_full,
-                language=None,
-                author_email=None,
-                created_at=ic.get("created_at"),
-                decision=None,
-                meta={"pr_number": pr_number, "pr_title": pr_title},
-            )
-            q.delete_chunks_for_artifact(conn, artifact_id)
-            q.insert_chunk(
-                conn,
-                artifact_id=artifact_id,
-                kind="review_comment",
-                text=body,
-                context={
-                    "diff_hunk": None,
-                    "pr_title": pr_title,
-                    "pr_number": pr_number,
-                    "repo": repo_full,
-                    "url": ic.get("html_url"),
-                },
-                language=None,
-            )
-            stats.issue_comments += 1
 
     if newest_updated and stats.prs_seen > 0:
         q.set_cursor(conn, "reviews", _bump_iso(newest_updated), target_id=target_id)
@@ -403,12 +291,19 @@ def _ingest_one_pr(
     pr_item: dict[str, Any],
     stats: ReviewStats,
     payload: _PrPayload | None = None,
+    keep_only_login: str | None = None,
 ) -> None:
     """Write one PR's artifacts (PR + comments) with content-hash skip.
 
     When `payload` is None, fetches the three sub-endpoints synchronously
     (legacy serial path). When supplied (parallel path), uses it and skips
-    the fetch."""
+    the fetch.
+
+    `keep_only_login` filters comments to a single author and sets the
+    PR-level `decision` from that author's most recent review state
+    (user-mode behavior). When None, all authors are kept and `decision`
+    is left None (org-mode behavior — per-reviewer decisions live in
+    `meta.reviewer_decisions` instead)."""
     pr_number = pr_item.get("number")
     if pr_number is None:
         stats.skipped += 1
@@ -440,8 +335,16 @@ def _ingest_one_pr(
 
     # PR-level artifact. content_hash covers the chunk source (title+body);
     # reviewer_decisions sits in meta and refreshes on every pass without
-    # needing a chunk rewrite.
+    # needing a chunk rewrite. User-mode also sets the artifact `decision`
+    # column from the keep-only author's most recent review state, which
+    # `predict_review_outcome` aggregates over.
     reviewer_decisions = _per_reviewer_decisions(reviews_all)
+    decision: str | None = None
+    if keep_only_login is not None:
+        my_reviews = [
+            r for r in reviews_all if (r.get("user") or {}).get("login") == keep_only_login
+        ]
+        decision = _decision_from_reviews(my_reviews)
     pr_body = pr_item.get("body") or ""
     pr_hash = _hash_text(pr_title, pr_body)
     pr_external = f"{repo_full}#{pr_number}"
@@ -474,7 +377,7 @@ def _ingest_one_pr(
             author_email=None,
             author_login=(pr_item.get("user") or {}).get("login"),
             created_at=pr_item.get("created_at"),
-            decision=None,
+            decision=decision,
             meta=pr_meta,
             content_hash=pr_hash,
         )
@@ -496,10 +399,13 @@ def _ingest_one_pr(
                 language=None,
             )
 
-    # Per-line review comments (have diff_hunk). Keep ALL authors.
+    # Per-line review comments (have diff_hunk). Keep ALL authors in org
+    # mode; user mode filters to `keep_only_login`.
     for rc in review_comments:
         author_login = (rc.get("user") or {}).get("login")
         if not author_login:
+            continue
+        if keep_only_login is not None and author_login != keep_only_login:
             continue
         body = (rc.get("body") or "").strip()
         if not body:
@@ -558,10 +464,13 @@ def _ingest_one_pr(
         )
         stats.review_comments += 1
 
-    # Issue-style PR comments (no diff_hunk). Keep ALL authors.
+    # Issue-style PR comments (no diff_hunk). Keep ALL authors in org
+    # mode; user mode filters to `keep_only_login`.
     for ic in issue_comments:
         author_login = (ic.get("user") or {}).get("login")
         if not author_login:
+            continue
+        if keep_only_login is not None and author_login != keep_only_login:
             continue
         body = (ic.get("body") or "").strip()
         if not body:
