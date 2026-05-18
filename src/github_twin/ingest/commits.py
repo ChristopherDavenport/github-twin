@@ -242,64 +242,6 @@ def _html_url(repo_full: str, sha: str) -> str:
     return f"https://github.com/{repo_full}/commit/{sha}"
 
 
-def _walk_repo_local(
-    *,
-    conn: sqlite3.Connection,
-    gh: GitHubClient | None,
-    cfg: IngestCfg,
-    target_id: int,
-    repo_full: str,
-    clone_path: Path,
-    head_sha: str,
-    last_walked_sha: str | None,
-    author_emails: list[str] | None,
-    resolve_author_login: bool,
-    limit: int | None,
-    stats: CommitStats,
-) -> None:
-    """Walk a single repo's commits via git locally.
-
-    `author_emails`  → restrict the log to commits authored by these emails
-                       (user mode).
-    `resolve_author_login` → look up `author_login` per email via the resolver
-                       (org mode).
-    """
-    if last_walked_sha:
-        range_args = [f"{last_walked_sha}..{head_sha}"]
-    else:
-        range_args = [head_sha, f"--since={cfg.since}"]
-
-    seen = 0
-    for row in _git_log(clone_path, range_args=range_args, author_emails=author_emails):
-        if limit is not None and seen >= limit:
-            break
-        seen += 1
-
-        diff = _git_show_diff(clone_path, row.sha)
-        if diff is None:
-            stats.skipped += 1
-            continue
-
-        author_login = None
-        if resolve_author_login:
-            author_login = resolve_login(conn, gh, row.email)
-
-        _write_commit_artifact(
-            conn=conn,
-            cfg=cfg,
-            target_id=target_id,
-            repo_full=repo_full,
-            sha=row.sha,
-            diff=diff,
-            commit_msg=row.message,
-            author_email=row.email or None,
-            author_login=author_login,
-            created_at=row.date,
-            url=_html_url(repo_full, row.sha),
-            stats=stats,
-        )
-
-
 # ---------- parallel org-mode pipeline ----------
 
 
@@ -386,10 +328,15 @@ def _walk_repo_records(
     last_commits_at: str | None,
     token: str | None,
     limit: int | None,
+    author_emails: list[str] | None = None,
 ) -> _RepoRecords:
     """Worker: clone, walk, chunk. Pure compute / subprocess / network — no
     DB access (so it's safe to run on a `ThreadPoolExecutor` while the
-    consumer owns the single SQLite connection)."""
+    consumer owns the single SQLite connection).
+
+    `author_emails` restricts the git log to commits authored by these
+    emails (user-mode). Org-mode leaves it None and walks everything.
+    """
     shallow_since = _shallow_since_for(last_commits_at, cfg)
     walk_since = _walk_since_for(last_commits_at, cfg)
     try:
@@ -401,7 +348,11 @@ def _walk_repo_records(
         ) as clone:
             records = _RepoRecords(repo_full=repo_full, head_sha=clone.head_sha)
             seen = 0
-            for row in _git_log(clone.path, range_args=[f"--since={walk_since}"]):
+            for row in _git_log(
+                clone.path,
+                range_args=[f"--since={walk_since}"],
+                author_emails=author_emails,
+            ):
                 if limit is not None and seen >= limit:
                     break
                 seen += 1
@@ -477,20 +428,28 @@ def _write_repo_records(
     target_id: int,
     records: _RepoRecords,
     stats: CommitStats,
+    resolve_author_login: bool = True,
 ) -> None:
     """Consumer: per-repo transaction; pre-resolve logins; write commits;
-    advance cursor. Runs on the main thread (owns the SQLite connection)."""
+    advance cursor. Runs on the main thread (owns the SQLite connection).
+
+    `resolve_author_login=False` skips the email→login lookup (user-mode,
+    where artifacts are stored with `author_login=NULL` by convention)."""
     if records.error is not None:
         log.warning("walk %s failed, skipping: %s", records.repo_full, records.error)
         stats.skipped += 1
         return
 
-    emails = {c.author_email for c in records.commits if c.author_email}
-    bulk_resolve_logins(conn, gh, emails)
+    if resolve_author_login:
+        emails = {c.author_email for c in records.commits if c.author_email}
+        bulk_resolve_logins(conn, gh, emails)
 
     with transaction(conn):
         for rec in records.commits:
-            author_login = resolve_login(conn, gh=None, email=rec.author_email)
+            if resolve_author_login:
+                author_login = resolve_login(conn, gh=None, email=rec.author_email)
+            else:
+                author_login = None
             _write_commit_artifact_from_record(
                 conn=conn,
                 cfg=cfg,
@@ -647,52 +606,126 @@ def _ingest_commits_local(
     target_id: int,
     limit: int | None,
 ) -> CommitStats:
-    stats = CommitStats()
-    email_set = {e.lower() for e in emails}
+    """Parallel user-mode commits walk — mirrors `_ingest_commits_org_local`.
 
-    repos = _discover_user_repos(gh, username=username, emails=emails, since=cfg.since)
-    log.info("user-mode commits: %d repos to walk", len(repos))
-    for repo_full in repos:
-        if not _allowed_repo(repo_full, cfg):
+    Three phases:
+
+    1. **Discover + fast-skip.** `/search/commits` enumerates repos the user
+       touched. A concurrent `/repos/{r}` batch collects `pushed_at` for
+       each; repos whose `pushed_at` hasn't moved past `last_commits_at`
+       are skipped — no clone, just a `pushed_at` refresh in the DB.
+    2. **Parallel walk.** A `ThreadPoolExecutor` runs `_walk_repo_records`
+       per remaining repo: shallow clone bounded by `--shallow-since`,
+       walk `git log --author <email>` + show, pre-build chunks. No DB
+       access from workers.
+    3. **Serial write.** As workers complete, each repo's commits land in
+       their own transaction. A failure in one repo doesn't roll back
+       the others; partial progress survives Ctrl-C.
+    """
+    stats = CommitStats()
+    discovered = _discover_user_repos(gh, username=username, emails=emails, since=cfg.since)
+    allowed = [r for r in discovered if _allowed_repo(r, cfg)]
+    log.info(
+        "user commits: discovered %d repos (%d after filters)",
+        len(discovered),
+        len(allowed),
+    )
+    if not allowed:
+        return stats
+
+    # Ensure repo rows exist so per-repo cursors persist across syncs.
+    for repo_full in allowed:
+        if q.get_repo(conn, target_id=target_id, full_name=repo_full) is None:
+            q.upsert_repo(
+                conn,
+                target_id=target_id,
+                full_name=repo_full,
+                default_branch=None,
+                pushed_at=None,
+                size_kb=None,
+            )
+
+    pushed_at_by_repo = _fetch_repo_pushed_at(gh, allowed, max_workers=cfg.repo_concurrency)
+
+    to_walk: list[dict[str, Any]] = []
+    skipped_unchanged = 0
+    for repo_full in allowed:
+        row = q.get_repo(conn, target_id=target_id, full_name=repo_full)
+        if row is None:
             continue
-        existing = q.get_repo(conn, target_id=target_id, full_name=repo_full)
-        last_walked = existing.get("last_commits_walked_sha") if existing else None
-        try:
-            with commits_clone(repo_full, cache_dir=cfg.clones_dir) as clone:
-                # Make sure the repo row exists so cursors persist.
-                if existing is None:
-                    q.upsert_repo(
-                        conn,
-                        target_id=target_id,
-                        full_name=repo_full,
-                        default_branch=None,
-                        pushed_at=None,
-                        size_kb=None,
-                    )
-                _walk_repo_local(
-                    conn=conn,
-                    gh=gh,
-                    cfg=cfg,
-                    target_id=target_id,
-                    repo_full=repo_full,
-                    clone_path=clone.path,
-                    head_sha=clone.head_sha,
-                    last_walked_sha=last_walked,
-                    author_emails=sorted(email_set),
-                    resolve_author_login=False,
-                    limit=limit,
-                    stats=stats,
-                )
-                q.set_repo_cursor(
+        pushed = pushed_at_by_repo.get(repo_full)
+        last = row.get("last_commits_at")
+        if not _needs_walk(pushed, last):
+            if pushed is not None and pushed != row.get("pushed_at"):
+                q.upsert_repo(
                     conn,
                     target_id=target_id,
                     full_name=repo_full,
-                    commits_walked_sha=clone.head_sha,
-                    commits_at=_now_iso(),
+                    default_branch=row.get("default_branch"),
+                    pushed_at=pushed,
+                    archived=bool(row.get("archived")),
+                    fork=bool(row.get("fork")),
+                    size_kb=row.get("size_kb"),
                 )
-        except CloneError as e:
-            log.warning("clone %s failed, skipping: %s", repo_full, e)
-            stats.skipped += 1
+            skipped_unchanged += 1
+            continue
+        to_walk.append(row)
+
+    if skipped_unchanged:
+        log.info("user commits: fast-skipped %d unchanged repos", skipped_unchanged)
+    log.info(
+        "user commits: walking %d repos in parallel (max %d workers)",
+        len(to_walk),
+        cfg.repo_concurrency,
+    )
+    if not to_walk:
+        return stats
+
+    sorted_emails = sorted({e.lower() for e in emails})
+    token = gh.token
+    workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-user-commits") as pool:
+        futures = {
+            pool.submit(
+                _walk_repo_records,
+                cfg=cfg,
+                repo_full=row["full_name"],
+                last_commits_at=row.get("last_commits_at"),
+                token=token,
+                limit=limit,
+                author_emails=sorted_emails,
+            ): row
+            for row in to_walk
+        }
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                records = fut.result()
+            except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
+                log.warning("worker %s crashed: %s", row["full_name"], e)
+                stats.skipped += 1
+                continue
+            pushed = pushed_at_by_repo.get(records.repo_full)
+            if pushed is not None and pushed != row.get("pushed_at"):
+                q.upsert_repo(
+                    conn,
+                    target_id=target_id,
+                    full_name=records.repo_full,
+                    default_branch=row.get("default_branch"),
+                    pushed_at=pushed,
+                    archived=bool(row.get("archived")),
+                    fork=bool(row.get("fork")),
+                    size_kb=row.get("size_kb"),
+                )
+            _write_repo_records(
+                conn=conn,
+                gh=gh,
+                cfg=cfg,
+                target_id=target_id,
+                records=records,
+                stats=stats,
+                resolve_author_login=False,
+            )
     return stats
 
 
