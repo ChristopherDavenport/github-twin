@@ -141,3 +141,27 @@ def test_is_shallow_helper(monkeypatch):
     assert clone_mod._is_shallow(Path("/x")) is True
     monkeypatch.setattr(clone_mod, "_git", lambda args, *, cwd=None: "false")
     assert clone_mod._is_shallow(Path("/x")) is False
+
+
+def test_git_decodes_non_utf8_output_with_replacement(monkeypatch, tmp_path: Path):
+    """`git show` of a diff containing non-UTF-8 bytes must not crash _git.
+
+    Reproduces the prod traceback: `UnicodeDecodeError: 'utf-8' codec can't
+    decode byte 0x95`. We shim a fake `git` executable on PATH that emits
+    bytes including the offending 0x95 (Windows-1252 bullet), then assert
+    `_git` returns a string with U+FFFD replacements.
+    """
+    fake_git_dir = tmp_path / "bin"
+    fake_git_dir.mkdir()
+    fake_git = fake_git_dir / "git"
+    # Python is a hard dev dep; using it for the shim avoids shell-quoting issues.
+    fake_git.write_text(
+        "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'hello \\x95 world')\n"
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_git_dir}:{__import__('os').environ['PATH']}")
+
+    out = clone_mod._git(["show", "deadbeef"])
+    assert "hello" in out
+    assert "world" in out
+    assert "�" in out  # U+FFFD REPLACEMENT CHARACTER
