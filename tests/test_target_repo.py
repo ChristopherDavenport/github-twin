@@ -195,11 +195,22 @@ def test_run_ingest_dispatches_repo_kind_through_org_path(conn_with_repo_target,
         called["files"] += 1
         return {"repos_walked": 0}
 
-    def fake_commits(*, conn, gh, cache, cfg, target_id, limit_per_repo=None):
+    def fake_commits(
+        *, conn, gh, cache, cfg, target_id, limit_per_repo=None, pushed_at_by_repo=None
+    ):
         called["commits"] += 1
         return {"new_commits": 0}
 
-    def fake_reviews(*, conn, gh, cache, cfg, target_id, limit_prs_per_repo=None):
+    def fake_reviews(
+        *,
+        conn,
+        gh,
+        cache,
+        cfg,
+        target_id,
+        limit_prs_per_repo=None,
+        pushed_at_by_repo=None,
+    ):
         called["reviews"] += 1
         return {"new_review_comments": 0}
 
@@ -219,8 +230,16 @@ def test_run_ingest_dispatches_repo_kind_through_org_path(conn_with_repo_target,
 
 
 class _NullClient:
+    token = "fake-token"
+
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
         return False
+
+    def get_json(self, path: str, *, params: dict | None = None):
+        # Backs the pipeline's `/repos/{r}` fast-skip pre-check. Returns an
+        # empty info dict so the test's fake_commits / fake_reviews receive
+        # a `pushed_at_by_repo={r: None}` and decide what to do internally.
+        return {}
