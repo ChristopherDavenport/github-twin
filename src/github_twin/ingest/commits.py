@@ -16,11 +16,13 @@ and rewritten on re-ingest.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +30,11 @@ from github_twin.config import IngestCfg
 from github_twin.ingest.cache import RawCache
 from github_twin.ingest.clone import CloneError, _git, commits_clone
 from github_twin.ingest.github_client import GitHubClient, GitHubError
-from github_twin.ingest.identity import resolve_login
+from github_twin.ingest.identity import bulk_resolve_logins, resolve_login
 from github_twin.process.chunkers import chunk_commit_message, chunk_diff
 from github_twin.process.language import language_for_path
 from github_twin.store import queries as q
+from github_twin.store.db import transaction
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +75,16 @@ def _allowed_repo(repo_full: str, cfg: IngestCfg) -> bool:
     return not (cfg.include_repos and not any(_match(repo_full, p) for p in cfg.include_repos))
 
 
+def _commit_content_hash(diff: str, commit_msg: str) -> str:
+    """sha256 over (diff, message). The message is included so a commit
+    amended with only a message change still re-chunks the message side."""
+    h = hashlib.sha256()
+    h.update(diff.encode("utf-8", errors="replace"))
+    h.update(b"\x00")
+    h.update(commit_msg.encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+
 def _write_commit_artifact(
     *,
     conn: sqlite3.Connection,
@@ -87,7 +100,32 @@ def _write_commit_artifact(
     url: str | None,
     stats: CommitStats,
 ) -> None:
-    """Persist one commit (artifact + chunks). Common to both ingest paths."""
+    """Persist one commit (artifact + chunks). Common to both ingest paths.
+
+    Short-circuits when the (diff, message) hash matches the stored
+    `artifact.content_hash` — refreshes metadata in place and skips the
+    chunk wipe+re-insert (and the implicit `vec_chunk` invalidation).
+    """
+    new_hash = _commit_content_hash(diff, commit_msg)
+    existing_id, existing_hash = q.get_artifact_content_hash(
+        conn, target_id=target_id, kind="commit", external_id=sha
+    )
+    meta = {
+        "sha": sha,
+        "message_first_line": commit_msg.splitlines()[0][:200] if commit_msg else "",
+    }
+    if existing_id is not None and existing_hash == new_hash:
+        # Same content; just refresh fields that may have improved
+        # (author_login newly resolved, content_hash backfilled).
+        q.update_artifact_metadata(
+            conn,
+            artifact_id=existing_id,
+            author_login=author_login,
+            content_hash=new_hash,
+        )
+        stats.fetched += 1
+        return
+
     artifact_id = q.upsert_artifact(
         conn,
         target_id=target_id,
@@ -100,10 +138,8 @@ def _write_commit_artifact(
         author_login=author_login,
         created_at=created_at,
         decision=None,
-        meta={
-            "sha": sha,
-            "message_first_line": commit_msg.splitlines()[0][:200] if commit_msg else "",
-        },
+        meta=meta,
+        content_hash=new_hash,
     )
     q.delete_chunks_for_artifact(conn, artifact_id)
 
@@ -264,6 +300,279 @@ def _walk_repo_local(
         )
 
 
+# ---------- parallel org-mode pipeline ----------
+
+
+@dataclass(frozen=True)
+class _PreChunk:
+    """A chunk computed in a worker thread, ready to insert on the writer."""
+
+    kind: str  # 'code' | 'commit_message'
+    text: str
+    context: dict[str, Any] | None
+    language: str | None
+
+
+@dataclass
+class _CommitRecord:
+    """One commit's worth of data assembled by a worker. No DB I/O involved."""
+
+    sha: str
+    diff: str
+    message: str
+    author_email: str | None
+    author_date: str  # ISO8601 from git log
+    url: str
+    pre_chunks: list[_PreChunk]
+
+
+@dataclass
+class _RepoRecords:
+    """Worker output for one repo. `error` set when the clone or walk failed."""
+
+    repo_full: str
+    head_sha: str
+    commits: list[_CommitRecord] = field(default_factory=list)
+    error: BaseException | None = None
+
+
+def _shallow_since_for(last_commits_at: str | None, cfg: IngestCfg) -> str:
+    """Compute the `--shallow-since` cutoff: cursor minus pad days, else
+    `cfg.since`. The pad absorbs small rebases / clock skew."""
+    base = last_commits_at or cfg.since
+    try:
+        dt = datetime.fromisoformat(base.replace("Z", "+00:00"))
+    except ValueError:
+        return base
+    padded = dt - timedelta(days=cfg.shallow_since_pad_days)
+    return padded.date().isoformat()
+
+
+def _walk_since_for(last_commits_at: str | None, cfg: IngestCfg) -> str:
+    """Compute the `git log --since` cutoff: cursor exactly, else `cfg.since`."""
+    return last_commits_at or cfg.since
+
+
+def _build_pre_chunks(
+    *, diff: str, message: str, repo_full: str, sha: str, url: str, cfg: IngestCfg
+) -> list[_PreChunk]:
+    """Pure chunking: no DB access, safe to call from worker threads."""
+    out: list[_PreChunk] = []
+    for ck in chunk_diff(
+        diff,
+        repo=repo_full,
+        sha=sha,
+        source_url=url,
+        exclude_patterns=cfg.exclude_paths,
+    ):
+        out.append(_PreChunk(kind="code", text=ck.text, context=ck.context, language=ck.language))
+    msg_chunk = chunk_commit_message(message, repo=repo_full, sha=sha, source_url=url)
+    if msg_chunk:
+        out.append(
+            _PreChunk(
+                kind="commit_message",
+                text=msg_chunk.text,
+                context=msg_chunk.context,
+                language=None,
+            )
+        )
+    return out
+
+
+def _walk_repo_records(
+    *,
+    cfg: IngestCfg,
+    repo_full: str,
+    last_commits_at: str | None,
+    token: str | None,
+    limit: int | None,
+) -> _RepoRecords:
+    """Worker: clone, walk, chunk. Pure compute / subprocess / network — no
+    DB access (so it's safe to run on a `ThreadPoolExecutor` while the
+    consumer owns the single SQLite connection)."""
+    shallow_since = _shallow_since_for(last_commits_at, cfg)
+    walk_since = _walk_since_for(last_commits_at, cfg)
+    try:
+        with commits_clone(
+            repo_full,
+            cache_dir=cfg.clones_dir,
+            token=token,
+            shallow_since=shallow_since,
+        ) as clone:
+            records = _RepoRecords(repo_full=repo_full, head_sha=clone.head_sha)
+            seen = 0
+            for row in _git_log(clone.path, range_args=[f"--since={walk_since}"]):
+                if limit is not None and seen >= limit:
+                    break
+                seen += 1
+                diff = _git_show_diff(clone.path, row.sha)
+                if diff is None:
+                    continue
+                pre_chunks = _build_pre_chunks(
+                    diff=diff,
+                    message=row.message,
+                    repo_full=repo_full,
+                    sha=row.sha,
+                    url=_html_url(repo_full, row.sha),
+                    cfg=cfg,
+                )
+                records.commits.append(
+                    _CommitRecord(
+                        sha=row.sha,
+                        diff=diff,
+                        message=row.message,
+                        author_email=row.email or None,
+                        author_date=row.date,
+                        url=_html_url(repo_full, row.sha),
+                        pre_chunks=pre_chunks,
+                    )
+                )
+            return records
+    except (CloneError, OSError) as e:
+        return _RepoRecords(repo_full=repo_full, head_sha="", error=e)
+
+
+def _fetch_repo_pushed_at(
+    gh: GitHubClient, repos: list[str], *, max_workers: int
+) -> dict[str, str | None]:
+    """Parallel `/repos/{owner}/{name}` for fast-skip + repo metadata refresh.
+
+    Returns a dict mapping `full_name` → pushed_at (ISO8601), or None when
+    the repo isn't reachable (404, transient error, archived without access).
+    The full info dict is dropped — we only need pushed_at for the skip
+    decision; callers that want more should re-fetch on demand."""
+    if not repos:
+        return {}
+
+    def _one(repo_full: str) -> tuple[str, str | None]:
+        try:
+            data = gh.get_json(f"/repos/{repo_full}")
+            return repo_full, data.get("pushed_at")
+        except GitHubError as e:
+            log.warning("/repos/%s failed: %s", repo_full, e)
+            return repo_full, None
+
+    workers = max(1, min(max_workers, len(repos)))
+    out: dict[str, str | None] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for repo_full, pushed_at in pool.map(_one, repos):
+            out[repo_full] = pushed_at
+    return out
+
+
+def _needs_walk(pushed_at: str | None, last_commits_at: str | None) -> bool:
+    """True when the repo may have new commits we haven't ingested.
+
+    Defaults conservative: if either side is missing we walk (no fast-skip)."""
+    if pushed_at is None or last_commits_at is None:
+        return True
+    return pushed_at > last_commits_at
+
+
+def _write_repo_records(
+    *,
+    conn: sqlite3.Connection,
+    gh: GitHubClient,
+    cfg: IngestCfg,
+    target_id: int,
+    records: _RepoRecords,
+    stats: CommitStats,
+) -> None:
+    """Consumer: per-repo transaction; pre-resolve logins; write commits;
+    advance cursor. Runs on the main thread (owns the SQLite connection)."""
+    if records.error is not None:
+        log.warning("walk %s failed, skipping: %s", records.repo_full, records.error)
+        stats.skipped += 1
+        return
+
+    emails = {c.author_email for c in records.commits if c.author_email}
+    bulk_resolve_logins(conn, gh, emails)
+
+    with transaction(conn):
+        for rec in records.commits:
+            author_login = resolve_login(conn, gh=None, email=rec.author_email)
+            _write_commit_artifact_from_record(
+                conn=conn,
+                cfg=cfg,
+                target_id=target_id,
+                repo_full=records.repo_full,
+                rec=rec,
+                author_login=author_login,
+                stats=stats,
+            )
+        q.set_repo_cursor(
+            conn,
+            target_id=target_id,
+            full_name=records.repo_full,
+            commits_walked_sha=records.head_sha,
+            commits_at=_now_iso(),
+        )
+
+
+def _write_commit_artifact_from_record(
+    *,
+    conn: sqlite3.Connection,
+    cfg: IngestCfg,
+    target_id: int,
+    repo_full: str,
+    rec: _CommitRecord,
+    author_login: str | None,
+    stats: CommitStats,
+) -> None:
+    """Variant of `_write_commit_artifact` that uses pre-built chunks.
+
+    Same content-hash short-circuit, but skips the chunk computation on
+    re-ingest of an unchanged commit (the work was already done in the
+    worker, but we don't insert)."""
+    new_hash = _commit_content_hash(rec.diff, rec.message)
+    existing_id, existing_hash = q.get_artifact_content_hash(
+        conn, target_id=target_id, kind="commit", external_id=rec.sha
+    )
+    if existing_id is not None and existing_hash == new_hash:
+        q.update_artifact_metadata(
+            conn,
+            artifact_id=existing_id,
+            author_login=author_login,
+            content_hash=new_hash,
+        )
+        stats.fetched += 1
+        return
+
+    artifact_id = q.upsert_artifact(
+        conn,
+        target_id=target_id,
+        kind="commit",
+        external_id=rec.sha,
+        source_url=rec.url,
+        repo=repo_full,
+        language=_primary_language(rec.diff),
+        author_email=rec.author_email,
+        author_login=author_login,
+        created_at=rec.author_date,
+        decision=None,
+        meta={
+            "sha": rec.sha,
+            "message_first_line": (rec.message.splitlines()[0][:200] if rec.message else ""),
+        },
+        content_hash=new_hash,
+    )
+    q.delete_chunks_for_artifact(conn, artifact_id)
+    for pc in rec.pre_chunks:
+        q.insert_chunk(
+            conn,
+            artifact_id=artifact_id,
+            kind=pc.kind,
+            text=pc.text,
+            context=pc.context,
+            language=pc.language,
+        )
+        if pc.kind == "code":
+            stats.code_chunks += 1
+        elif pc.kind == "commit_message":
+            stats.message_chunks += 1
+    stats.fetched += 1
+
+
 # ---------- user-mode entry point ----------
 
 
@@ -398,10 +707,13 @@ def ingest_commits_org(
     cfg: IngestCfg,
     target_id: int,
     limit_per_repo: int | None = None,
+    pushed_at_by_repo: dict[str, str | None] | None = None,
 ) -> CommitStats:
     """Walk every repo's commits since its per-repo cursor.
 
     Author identity (`author_login`) is captured via the email→login cache.
+    The optional `pushed_at_by_repo` lets the pipeline share the
+    `/repos/{r}` batch with the reviews phase so we don't pay it twice.
     """
     if cfg.use_local_git_for_commits:
         return _ingest_commits_org_local(
@@ -410,6 +722,7 @@ def ingest_commits_org(
             cfg=cfg,
             target_id=target_id,
             limit_per_repo=limit_per_repo,
+            pushed_at_by_repo=pushed_at_by_repo,
         )
     return _ingest_commits_org_api(
         conn=conn,
@@ -428,40 +741,117 @@ def _ingest_commits_org_local(
     cfg: IngestCfg,
     target_id: int,
     limit_per_repo: int | None,
+    pushed_at_by_repo: dict[str, str | None] | None = None,
 ) -> CommitStats:
+    """Parallel org-mode commits walk.
+
+    Three phases:
+
+    1. **Fast-skip.** Batch `/repos/{r}` calls (concurrent) collect
+       `pushed_at` for every allowed repo. Repos whose `pushed_at` hasn't
+       moved past `last_commits_at` are skipped — no clone, no fetch,
+       just a `pushed_at` refresh in the DB.
+    2. **Parallel walk.** A `ThreadPoolExecutor` runs
+       `_walk_repo_records` per remaining repo: shallow clone bounded
+       by `--shallow-since`, walk git log + show, pre-build chunks.
+       No DB access from workers.
+    3. **Serial write.** As workers complete, the main thread resolves
+       any new author emails (`bulk_resolve_logins`) and writes each
+       repo's commits in its own transaction, advancing the per-repo
+       cursor on commit. A failure in one repo doesn't roll back the
+       others.
+
+    `pushed_at_by_repo` may be supplied by the caller (e.g. pipeline
+    sharing the batch with the reviews phase). When None, this function
+    fetches its own batch.
+    """
     stats = CommitStats()
-    for row in q.list_repos(conn, target_id=target_id):
+    all_repos = q.list_repos(conn, target_id=target_id)
+    allowed = [r for r in all_repos if _allowed_repo(r["full_name"], cfg)]
+    if not allowed:
+        return stats
+
+    repo_names = [r["full_name"] for r in allowed]
+    if pushed_at_by_repo is None:
+        pushed_at_by_repo = _fetch_repo_pushed_at(gh, repo_names, max_workers=cfg.repo_concurrency)
+
+    to_walk: list[dict[str, Any]] = []
+    skipped_unchanged = 0
+    for row in allowed:
         repo_full = row["full_name"]
-        if not _allowed_repo(repo_full, cfg):
-            continue
-        last_walked = row.get("last_commits_walked_sha")
-        log.info("commits org (local): %s since %s", repo_full, last_walked or cfg.since)
-        try:
-            with commits_clone(repo_full, cache_dir=cfg.clones_dir) as clone:
-                _walk_repo_local(
-                    conn=conn,
-                    gh=gh,
-                    cfg=cfg,
-                    target_id=target_id,
-                    repo_full=repo_full,
-                    clone_path=clone.path,
-                    head_sha=clone.head_sha,
-                    last_walked_sha=last_walked,
-                    author_emails=None,
-                    resolve_author_login=True,
-                    limit=limit_per_repo,
-                    stats=stats,
-                )
-                q.set_repo_cursor(
+        pushed = pushed_at_by_repo.get(repo_full)
+        last = row.get("last_commits_at")
+        if not _needs_walk(pushed, last):
+            # Repo hasn't moved; just refresh pushed_at and skip the clone.
+            if pushed is not None and pushed != row.get("pushed_at"):
+                q.upsert_repo(
                     conn,
                     target_id=target_id,
                     full_name=repo_full,
-                    commits_walked_sha=clone.head_sha,
-                    commits_at=_now_iso(),
+                    default_branch=row.get("default_branch"),
+                    pushed_at=pushed,
+                    archived=bool(row.get("archived")),
+                    fork=bool(row.get("fork")),
+                    size_kb=row.get("size_kb"),
                 )
-        except CloneError as e:
-            log.warning("clone %s failed, skipping: %s", repo_full, e)
-            stats.skipped += 1
+            skipped_unchanged += 1
+            continue
+        to_walk.append(row)
+
+    if skipped_unchanged:
+        log.info("commits org: fast-skipped %d unchanged repos", skipped_unchanged)
+    log.info(
+        "commits org: walking %d repos in parallel (max %d workers)",
+        len(to_walk),
+        cfg.repo_concurrency,
+    )
+
+    if not to_walk:
+        return stats
+
+    token = gh.token  # resolve once; pass to every worker
+    workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-commits") as pool:
+        futures = {
+            pool.submit(
+                _walk_repo_records,
+                cfg=cfg,
+                repo_full=row["full_name"],
+                last_commits_at=row.get("last_commits_at"),
+                token=token,
+                limit=limit_per_repo,
+            ): row
+            for row in to_walk
+        }
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                records = fut.result()
+            except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
+                log.warning("worker %s crashed: %s", row["full_name"], e)
+                stats.skipped += 1
+                continue
+            # Refresh pushed_at on success too, so future syncs can fast-skip.
+            pushed = pushed_at_by_repo.get(records.repo_full)
+            if pushed is not None and pushed != row.get("pushed_at"):
+                q.upsert_repo(
+                    conn,
+                    target_id=target_id,
+                    full_name=records.repo_full,
+                    default_branch=row.get("default_branch"),
+                    pushed_at=pushed,
+                    archived=bool(row.get("archived")),
+                    fork=bool(row.get("fork")),
+                    size_kb=row.get("size_kb"),
+                )
+            _write_repo_records(
+                conn=conn,
+                gh=gh,
+                cfg=cfg,
+                target_id=target_id,
+                records=records,
+                stats=stats,
+            )
     return stats
 
 
