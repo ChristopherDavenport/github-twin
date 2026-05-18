@@ -136,6 +136,16 @@ class IngestCfg(BaseModel):
     # paginating /repos/{r}/commits + per-sha patch fetches. Default; flip to
     # False to fall back to the API path during rollback.
     use_local_git_for_commits: bool = True
+    # Org-mode per-repo worker concurrency for the parallel commits / reviews
+    # walk. Bounded because each worker holds a clone open and may run an
+    # API-pagination loop in parallel. 6 is a safe default for a laptop on
+    # GitHub's 5000/hr authenticated rate limit; raise to 12-16 on a runner
+    # with bandwidth + a token that isn't shared with other traffic.
+    repo_concurrency: int = 6
+    # `--shallow-since` cutoff is set to `(last_commits_at or since) - N days`.
+    # The pad absorbs small rebases and clock skew so a force-push that
+    # rewrites recent history doesn't fall outside the shallow window.
+    shallow_since_pad_days: int = 1
 
 
 class IdentityCfg(BaseModel):
