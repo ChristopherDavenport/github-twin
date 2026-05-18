@@ -11,22 +11,41 @@ All comment filtering is by login (identity-stable), not email.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from github_twin.config import IngestCfg
 from github_twin.ingest.cache import RawCache
-from github_twin.ingest.commits import _bump_iso, _match
+from github_twin.ingest.commits import (
+    _allowed_repo,
+    _bump_iso,
+    _fetch_repo_pushed_at,
+    _match,
+    _needs_walk,
+)
 from github_twin.ingest.github_client import GitHubClient, GitHubError
 from github_twin.process.chunkers import chunk_pr_summary
 from github_twin.process.language import language_for_path
 from github_twin.store import queries as q
+from github_twin.store.db import transaction
 
 log = logging.getLogger(__name__)
+
+
+def _hash_text(*parts: str) -> str:
+    """sha256 over a sequence of strings, NUL-separated for unambiguous join."""
+    h = hashlib.sha256()
+    for i, part in enumerate(parts):
+        if i:
+            h.update(b"\x00")
+        h.update(part.encode("utf-8", errors="replace"))
+    return h.hexdigest()
 
 
 @dataclass
@@ -324,23 +343,26 @@ def _per_reviewer_decisions(reviews_all: list[dict[str, Any]]) -> list[dict[str,
     return sorted(by_login.values(), key=lambda d: d["submitted_at"])
 
 
-def _ingest_one_pr(
-    *,
-    conn: sqlite3.Connection,
-    gh: GitHubClient,
-    cache: RawCache,
-    target_id: int,
-    repo_full: str,
-    pr_item: dict[str, Any],
-    stats: ReviewStats,
-) -> None:
+@dataclass
+class _PrPayload:
+    """Raw PR data fetched by a worker; consumed on the writer thread."""
+
+    pr_item: dict[str, Any]
+    review_comments: list[dict[str, Any]]
+    reviews_all: list[dict[str, Any]]
+    issue_comments: list[dict[str, Any]]
+
+
+def _fetch_pr_payload(
+    gh: GitHubClient, repo_full: str, pr_item: dict[str, Any]
+) -> _PrPayload | None:
+    """Pull the three sub-endpoints for one PR. No DB access — safe in workers.
+
+    Returns None on GitHubError so the caller can record the skip without
+    aborting the whole repo."""
     pr_number = pr_item.get("number")
     if pr_number is None:
-        stats.skipped += 1
-        return
-    pr_title = pr_item.get("title") or ""
-    cache_key = f"{repo_full}__{pr_number}"
-
+        return None
     try:
         review_comments = list(
             gh.paginate(
@@ -362,8 +384,47 @@ def _ingest_one_pr(
         )
     except GitHubError as e:
         log.warning("skip %s#%d: %s", repo_full, pr_number, e)
+        return None
+    return _PrPayload(
+        pr_item=pr_item,
+        review_comments=review_comments,
+        reviews_all=reviews_all,
+        issue_comments=issue_comments,
+    )
+
+
+def _ingest_one_pr(
+    *,
+    conn: sqlite3.Connection,
+    gh: GitHubClient,
+    cache: RawCache,
+    target_id: int,
+    repo_full: str,
+    pr_item: dict[str, Any],
+    stats: ReviewStats,
+    payload: _PrPayload | None = None,
+) -> None:
+    """Write one PR's artifacts (PR + comments) with content-hash skip.
+
+    When `payload` is None, fetches the three sub-endpoints synchronously
+    (legacy serial path). When supplied (parallel path), uses it and skips
+    the fetch."""
+    pr_number = pr_item.get("number")
+    if pr_number is None:
         stats.skipped += 1
         return
+    pr_title = pr_item.get("title") or ""
+    cache_key = f"{repo_full}__{pr_number}"
+
+    if payload is None:
+        payload = _fetch_pr_payload(gh, repo_full, pr_item)
+        if payload is None:
+            stats.skipped += 1
+            return
+
+    review_comments = payload.review_comments
+    reviews_all = payload.reviews_all
+    issue_comments = payload.issue_comments
 
     cache.write_json(
         "reviews",
@@ -377,45 +438,63 @@ def _ingest_one_pr(
     )
     stats.prs_seen += 1
 
-    # PR-level artifact carries per-reviewer decisions so predict_review_outcome
-    # can filter to one reviewer in org-mode. Top-level `decision` stays NULL
-    # (a multi-reviewer PR has no single decision).
+    # PR-level artifact. content_hash covers the chunk source (title+body);
+    # reviewer_decisions sits in meta and refreshes on every pass without
+    # needing a chunk rewrite.
     reviewer_decisions = _per_reviewer_decisions(reviews_all)
-    pr_artifact_id = q.upsert_artifact(
-        conn,
-        target_id=target_id,
-        kind="pr",
-        external_id=f"{repo_full}#{pr_number}",
-        source_url=pr_item.get("html_url"),
-        repo=repo_full,
-        language=None,
-        author_email=None,
-        author_login=(pr_item.get("user") or {}).get("login"),
-        created_at=pr_item.get("created_at"),
-        decision=None,
-        meta={
-            "title": pr_title,
-            "state": pr_item.get("state"),
-            "reviewer_decisions": reviewer_decisions,
-        },
+    pr_body = pr_item.get("body") or ""
+    pr_hash = _hash_text(pr_title, pr_body)
+    pr_external = f"{repo_full}#{pr_number}"
+    pr_meta = {
+        "title": pr_title,
+        "state": pr_item.get("state"),
+        "reviewer_decisions": reviewer_decisions,
+    }
+    existing_pr_id, existing_pr_hash = q.get_artifact_content_hash(
+        conn, target_id=target_id, kind="pr", external_id=pr_external
     )
-    q.delete_chunks_for_artifact(conn, pr_artifact_id)
-    summary = chunk_pr_summary(
-        title=pr_title,
-        body=pr_item.get("body"),
-        repo=repo_full,
-        pr_number=pr_number,
-        source_url=pr_item.get("html_url"),
-    )
-    if summary is not None:
-        q.insert_chunk(
+    if existing_pr_id is not None and existing_pr_hash == pr_hash:
+        # Title + body unchanged; refresh metadata (reviewer_decisions may
+        # have moved) and keep the existing pr_summary chunk + embedding.
+        q.update_artifact_metadata(
             conn,
-            artifact_id=pr_artifact_id,
-            kind="pr_summary",
-            text=summary.text,
-            context=summary.context,
-            language=None,
+            artifact_id=existing_pr_id,
+            meta=pr_meta,
+            content_hash=pr_hash,
         )
+    else:
+        pr_artifact_id = q.upsert_artifact(
+            conn,
+            target_id=target_id,
+            kind="pr",
+            external_id=pr_external,
+            source_url=pr_item.get("html_url"),
+            repo=repo_full,
+            language=None,
+            author_email=None,
+            author_login=(pr_item.get("user") or {}).get("login"),
+            created_at=pr_item.get("created_at"),
+            decision=None,
+            meta=pr_meta,
+            content_hash=pr_hash,
+        )
+        q.delete_chunks_for_artifact(conn, pr_artifact_id)
+        summary = chunk_pr_summary(
+            title=pr_title,
+            body=pr_item.get("body"),
+            repo=repo_full,
+            pr_number=pr_number,
+            source_url=pr_item.get("html_url"),
+        )
+        if summary is not None:
+            q.insert_chunk(
+                conn,
+                artifact_id=pr_artifact_id,
+                kind="pr_summary",
+                text=summary.text,
+                context=summary.context,
+                language=None,
+            )
 
     # Per-line review comments (have diff_hunk). Keep ALL authors.
     for rc in review_comments:
@@ -429,6 +508,20 @@ def _ingest_one_pr(
         path = rc.get("path") or ""
         lang = language_for_path(path)
         diff_hunk = rc.get("diff_hunk") or ""
+        rc_hash = _hash_text(body, diff_hunk)
+
+        existing_id, existing_hash = q.get_artifact_content_hash(
+            conn, target_id=target_id, kind="review_comment", external_id=self_id
+        )
+        if existing_id is not None and existing_hash == rc_hash:
+            q.update_artifact_metadata(
+                conn,
+                artifact_id=existing_id,
+                author_login=author_login,
+                content_hash=rc_hash,
+            )
+            stats.review_comments += 1
+            continue
 
         artifact_id = q.upsert_artifact(
             conn,
@@ -443,6 +536,7 @@ def _ingest_one_pr(
             created_at=rc.get("created_at"),
             decision=None,
             meta={"pr_number": pr_number, "pr_title": pr_title, "path": path},
+            content_hash=rc_hash,
         )
         q.delete_chunks_for_artifact(conn, artifact_id)
         q.insert_chunk(
@@ -473,6 +567,20 @@ def _ingest_one_pr(
         if not body:
             continue
         self_id = str(ic.get("id"))
+        ic_hash = _hash_text(body)
+
+        existing_id, existing_hash = q.get_artifact_content_hash(
+            conn, target_id=target_id, kind="issue_comment", external_id=self_id
+        )
+        if existing_id is not None and existing_hash == ic_hash:
+            q.update_artifact_metadata(
+                conn,
+                artifact_id=existing_id,
+                author_login=author_login,
+                content_hash=ic_hash,
+            )
+            stats.issue_comments += 1
+            continue
 
         artifact_id = q.upsert_artifact(
             conn,
@@ -487,6 +595,7 @@ def _ingest_one_pr(
             created_at=ic.get("created_at"),
             decision=None,
             meta={"pr_number": pr_number, "pr_title": pr_title},
+            content_hash=ic_hash,
         )
         q.delete_chunks_for_artifact(conn, artifact_id)
         q.insert_chunk(
@@ -507,6 +616,39 @@ def _ingest_one_pr(
         stats.issue_comments += 1
 
 
+@dataclass
+class _RepoReviewRecords:
+    """Worker output: pre-fetched PR payloads for one repo."""
+
+    repo_full: str
+    payloads: list[_PrPayload] = field(default_factory=list)
+    error: BaseException | None = None
+
+
+def _walk_repo_reviews(
+    *,
+    gh: GitHubClient,
+    repo_full: str,
+    cursor: str | None,
+    limit_prs: int | None,
+) -> _RepoReviewRecords:
+    """Worker: enumerate PRs above the cursor and fetch each PR's
+    sub-endpoint payload. No DB or RawCache writes — pure fetch."""
+    records = _RepoReviewRecords(repo_full=repo_full)
+    try:
+        for seen, pr_item in enumerate(
+            _iter_prs_until_cursor(gh, repo_full=repo_full, cursor=cursor)
+        ):
+            if limit_prs is not None and seen >= limit_prs:
+                break
+            payload = _fetch_pr_payload(gh, repo_full, pr_item)
+            if payload is not None:
+                records.payloads.append(payload)
+    except GitHubError as e:
+        records.error = e
+    return records
+
+
 def ingest_reviews_org(
     *,
     conn: sqlite3.Connection,
@@ -515,27 +657,84 @@ def ingest_reviews_org(
     cfg: IngestCfg,
     target_id: int,
     limit_prs_per_repo: int | None = None,
+    pushed_at_by_repo: dict[str, str | None] | None = None,
 ) -> ReviewStats:
-    """Walk every repo's recently-updated PRs, capturing comments from all
-    authors. Per-repo cursor is `last_reviews_at`; advance after each repo."""
+    """Parallel org-mode reviews walk.
+
+    Mirrors the commits-org pipeline (fast-skip → parallel fetch → serial
+    write). Per-repo cursor is `last_reviews_at`; advance after each repo
+    in its own transaction so partial failures don't roll back peers."""
     stats = ReviewStats()
-    repos = q.list_repos(conn, target_id=target_id)
-    for row in repos:
-        repo_full = row["full_name"]
-        cursor = row.get("last_reviews_at")
-        for seen, pr_item in enumerate(
-            _iter_prs_until_cursor(gh, repo_full=repo_full, cursor=cursor)
-        ):
-            if limit_prs_per_repo is not None and seen >= limit_prs_per_repo:
-                break
-            _ingest_one_pr(
-                conn=conn,
+    all_repos = q.list_repos(conn, target_id=target_id)
+    allowed = [r for r in all_repos if _allowed_repo(r["full_name"], cfg)]
+    if not allowed:
+        return stats
+
+    repo_names = [r["full_name"] for r in allowed]
+    if pushed_at_by_repo is None:
+        pushed_at_by_repo = _fetch_repo_pushed_at(gh, repo_names, max_workers=cfg.repo_concurrency)
+
+    to_walk: list[dict[str, Any]] = []
+    skipped_unchanged = 0
+    for row in allowed:
+        pushed = pushed_at_by_repo.get(row["full_name"])
+        last_reviews = row.get("last_reviews_at")
+        if not _needs_walk(pushed, last_reviews):
+            skipped_unchanged += 1
+            continue
+        to_walk.append(row)
+
+    if skipped_unchanged:
+        log.info("reviews org: fast-skipped %d unchanged repos", skipped_unchanged)
+    log.info(
+        "reviews org: walking %d repos in parallel (max %d workers)",
+        len(to_walk),
+        cfg.repo_concurrency,
+    )
+
+    if not to_walk:
+        return stats
+
+    workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-reviews") as pool:
+        futures = {
+            pool.submit(
+                _walk_repo_reviews,
                 gh=gh,
-                cache=cache,
-                target_id=target_id,
-                repo_full=repo_full,
-                pr_item=pr_item,
-                stats=stats,
-            )
-        q.set_repo_cursor(conn, target_id=target_id, full_name=repo_full, reviews_at=_now_iso())
+                repo_full=row["full_name"],
+                cursor=row.get("last_reviews_at"),
+                limit_prs=limit_prs_per_repo,
+            ): row
+            for row in to_walk
+        }
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                records = fut.result()
+            except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
+                log.warning("worker %s crashed: %s", row["full_name"], e)
+                stats.skipped += 1
+                continue
+            if records.error is not None:
+                log.warning("reviews fetch %s failed: %s", records.repo_full, records.error)
+                stats.skipped += 1
+                continue
+            with transaction(conn):
+                for payload in records.payloads:
+                    _ingest_one_pr(
+                        conn=conn,
+                        gh=gh,
+                        cache=cache,
+                        target_id=target_id,
+                        repo_full=records.repo_full,
+                        pr_item=payload.pr_item,
+                        stats=stats,
+                        payload=payload,
+                    )
+                q.set_repo_cursor(
+                    conn,
+                    target_id=target_id,
+                    full_name=records.repo_full,
+                    reviews_at=_now_iso(),
+                )
     return stats
