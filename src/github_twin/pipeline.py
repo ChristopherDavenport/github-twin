@@ -42,7 +42,12 @@ class IdentityMissingError(RuntimeError):
 #   2 — deterministic per-kind headers (path / symbol / leading_doc / etc.).
 #   3 — adds `chunk.summary` (LLM-generated NL description) to the code/file
 #       header lines. Bridges NL queries to identifier-only code chunks.
-EMBED_TEXT_VERSION = 3
+#   4 — adds the `note` chunk kind (scratch-note round-trip from the wiki
+#       vault) with a `# note: {title}` header. Pre-existing chunk kinds
+#       still emit identical prefixes; the version bump is so corpora
+#       built before this change re-embed once and the cursor advances
+#       atomically across the new + old kinds at the same version.
+EMBED_TEXT_VERSION = 4
 _EMBED_VERSION_KEY = "embed_text_version"
 
 
