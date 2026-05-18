@@ -75,8 +75,13 @@ _LINK_NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 class GitHubClient:
     def __init__(self, token: str | None = None, *, timeout: float = DEFAULT_TIMEOUT):
         self._token = token or _resolve_token()
+        # Pool sized for parallel per-repo workers. Default httpx limits
+        # (max_connections=100, max_keepalive_connections=20) are fine for
+        # most call sites, but we set them explicitly so the bound is
+        # visible at the seam and easy to tune.
         self._client = httpx.Client(
             timeout=timeout,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
             headers={
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._token}",
@@ -84,6 +89,12 @@ class GitHubClient:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+
+    @property
+    def token(self) -> str:
+        """The resolved token, for callers that need to pass it to a
+        subprocess (e.g. git clone) without re-running `_resolve_token`."""
+        return self._token
 
     def close(self) -> None:
         self._client.close()
