@@ -177,6 +177,28 @@ class AuthCfg(BaseModel):
     default_scopes: str = "repo read:org user:email"
 
 
+class WikiCfg(BaseModel):
+    """`gt wiki export` — materialize a markdown vault on top of the SQLite
+    corpus. The vault is Obsidian-compatible (frontmatter + `[[wikilinks]]`)
+    and sits under `paths.data_dir / 'wiki'` by default; override per-run with
+    `gt wiki export --out PATH`.
+
+    Round-trip: any `.md` you drop into `<vault>/scratch/` is ingested as a
+    `kind='note'` artifact on the next `gt sync` and feeds into hybrid
+    retrieval like any other chunk. Auto-generated wiki files carry a
+    `generated: true` frontmatter flag so the scratch ingester (which only
+    scans `scratch/`) can never loop on its own output.
+    """
+
+    enabled: bool = True
+    # None resolves to `paths.data_dir / 'wiki'` at call time.
+    out: Path | None = None
+    # Window size for splitting scratch notes into chunks. ~1200 chars
+    # keeps each chunk's embed-time prefix dominant in vector space while
+    # still capturing a paragraph or two of narrative.
+    note_chunk_chars: int = 1200
+
+
 class DistillCfg(BaseModel):
     # Sonnet is the cost/quality sweet spot for ~20-50 cluster runs; bump to
     # claude-opus-4-7 if rules feel shallow.
@@ -210,6 +232,7 @@ class Config(BaseSettings):
     summarize: SummarizeCfg = Field(default_factory=SummarizeCfg)
     distill: DistillCfg = Field(default_factory=DistillCfg)
     auth: AuthCfg = Field(default_factory=AuthCfg)
+    wiki: WikiCfg = Field(default_factory=WikiCfg)
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Config:

@@ -70,10 +70,16 @@ targets_app = typer.Typer(
     no_args_is_help=True,
     help="Manage the targets (user / org / repo) tracked in this DB.",
 )
+wiki_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Materialize the corpus as a markdown vault and ingest scratch notes.",
+)
 app.add_typer(clones_app, name="clones")
 app.add_typer(eval_app, name="eval")
 app.add_typer(auth_app, name="auth")
 app.add_typer(targets_app, name="targets")
+app.add_typer(wiki_app, name="wiki")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -710,6 +716,11 @@ def sync(
         "--skip-summarize",
         help="Don't auto-run summarize before embed.",
     ),
+    skip_wiki: bool = typer.Option(
+        False,
+        "--skip-wiki",
+        help="Don't ingest scratch notes or export the wiki vault.",
+    ),
     target: str | None = typer.Option(
         None, "--target", help="Restrict to one target (by name). Default: all."
     ),
@@ -719,9 +730,19 @@ def sync(
 
     Without `--target`, iterates every target in the DB and runs ingest
     for each. Summarize + embed are corpus-wide and run once at the end.
+
+    Wiki round-trip (skip with `--skip-wiki`):
+    - Before GitHub ingest: scratch-note ingest (`<vault>/scratch/*.md`
+      → `kind='note'` artifacts).
+    - After embed: export the vault (rules / profiles / repos / index)
+      under `<vault_root>` so the disk view tracks the DB.
     """
     cfg, conn = _ctx(config)
     target_filter = _resolve_target_arg(conn, target)
+
+    if not skip_wiki and cfg.wiki.enabled:
+        _ingest_scratch_notes(cfg, conn, target_filter=target_filter)
+
     _run_ingest_safely(
         cfg,
         conn,
@@ -734,6 +755,110 @@ def sync(
     if not skip_summarize:
         run_summarize(cfg, conn, report=_report)
     run_embed(cfg, conn, rebuild=False, batch_size=cfg.embed.batch_size, report=_report)
+
+    if not skip_wiki and cfg.wiki.enabled:
+        _export_wiki_safely(
+            cfg,
+            conn,
+            target=target_filter.name if target_filter else None,
+        )
+
+
+def _ingest_scratch_notes(
+    cfg: Config, conn: sqlite3.Connection, *, target_filter: Target | None
+) -> None:
+    """Vault round-trip step. Picks an anchor target (the filter if given,
+    else the first target in the DB), reads `<vault>/scratch/`, and
+    upserts notes as `kind='note'` artifacts. Silently skips when no
+    targets exist or the scratch dir is missing."""
+    from github_twin.wiki import ingest_notes, resolve_vault_root
+
+    anchor: Target | None = target_filter
+    if anchor is None:
+        targets = load_targets(conn)
+        if not targets:
+            return
+        anchor = targets[0]
+    assert anchor.id is not None
+
+    vault_root = resolve_vault_root(cfg)
+    scratch_dir = vault_root / "scratch"
+    if not scratch_dir.exists():
+        return
+    ingest_notes(
+        conn,
+        scratch_dir=scratch_dir,
+        target_id=anchor.id,
+        note_chunk_chars=cfg.wiki.note_chunk_chars,
+        report=_report,
+    )
+
+
+def _export_wiki_safely(cfg: Config, conn: sqlite3.Connection, *, target: str | None) -> None:
+    """Vault export step. Best-effort LLM resolution: if no backend is
+    configured (or it raises at construction time), we still emit
+    placeholder profile pages so the vault shape stays predictable.
+    """
+    from github_twin.wiki import export_wiki
+
+    try:
+        llm = make_text_llm(
+            claude_model=cfg.summarize.claude_model,
+            gemini_model=cfg.summarize.gemini_model,
+            ollama_model=cfg.summarize.ollama_model,
+            prefer=cfg.summarize.backend,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a warning, not a hard fail
+        log.warning("wiki export: no LLM available (%s); profiles will be placeholders", exc)
+        llm = None
+    export_wiki(conn, cfg, target=target, profile_llm=llm, report=_report)
+
+
+@wiki_app.command("export")
+def wiki_export(
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help="Vault root override. Default: cfg.wiki.out or <data_dir>/wiki.",
+    ),
+    target: str | None = typer.Option(
+        None, "--target", help="Restrict to one target by name. Default: every target."
+    ),
+    skip_profiles: bool = typer.Option(
+        False,
+        "--skip-profiles",
+        help="Don't call the LLM to synthesize developer profiles; emit placeholders.",
+    ),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """Materialize the corpus as a markdown vault.
+
+    Idempotent: re-running writes only files whose body changed and
+    prunes generated files that fell out (a distilled rule that got
+    merged into another cluster, an author who left the org, etc.).
+    Hand-written notes (no `generated: true` frontmatter) are never
+    touched.
+    """
+    from github_twin.wiki import export_wiki
+
+    cfg, conn = _ctx(config)
+    llm = None
+    if not skip_profiles:
+        try:
+            llm = make_text_llm(
+                claude_model=cfg.summarize.claude_model,
+                gemini_model=cfg.summarize.gemini_model,
+                ollama_model=cfg.summarize.ollama_model,
+                prefer=cfg.summarize.backend,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("no LLM available (%s); profiles will be placeholders", exc)
+            llm = None
+    summary = export_wiki(conn, cfg, out=out, target=target, profile_llm=llm, report=_report)
+    console.print(
+        f"[bold]wiki:[/bold] {summary['written']} written, "
+        f"{summary['unchanged']} unchanged, {summary['removed']} removed"
+    )
 
 
 @app.command()
