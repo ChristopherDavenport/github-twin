@@ -181,6 +181,14 @@ class SummarizeCfg(BaseModel):
     profile_max_tokens: int = 600
     # Kinds to summarize. Keep code-shaped; NL kinds opt out by design.
     kinds: tuple[str, ...] = ("code", "file", "code_rule", "commit_message")
+    # Parallel LLM requests for `gt summarize`. None = "auto" — resolved in
+    # `pipeline.run_summarize` from `_DEFAULT_CONCURRENCY`: 1 for ollama
+    # (local; the model is GPU/CPU-bound and Ollama serializes internally),
+    # 4 for claude, 4 for gemini (safe under free-tier 10 RPM; bump for
+    # paid tiers). Pin an int to override; bound to [1, 64] to keep the
+    # pool from outpacing any sane rate limit. DB writes stay serialized
+    # on the calling thread regardless.
+    concurrency: int | None = Field(default=None, ge=1, le=64)
 
 
 class AuthCfg(BaseModel):
