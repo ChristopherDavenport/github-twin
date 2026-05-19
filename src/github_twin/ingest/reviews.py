@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -148,20 +149,38 @@ def ingest_reviews(
         return stats
 
     workers = max(1, min(cfg.repo_concurrency, len(filtered)))
+    total = len(filtered)
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-user-reviews") as pool:
         futures = {
-            pool.submit(_fetch_pr_payload, gh, repo_full, pr_item): (repo_full, pr_item)
+            pool.submit(_fetch_pr_payload_timed, gh, repo_full, pr_item): (repo_full, pr_item)
             for repo_full, pr_item in filtered
         }
         for fut in as_completed(futures):
+            completed += 1
             repo_full, pr_item = futures[fut]
             try:
-                payload = fut.result()
+                payload, elapsed = fut.result()
             except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
-                log.warning("worker %s#%s crashed: %s", repo_full, pr_item.get("number"), e)
+                log.warning(
+                    "user reviews: [%d/%d] worker %s#%s crashed: %s",
+                    completed,
+                    total,
+                    repo_full,
+                    pr_item.get("number"),
+                    e,
+                )
                 stats.skipped += 1
                 continue
             if payload is None:
+                log.info(
+                    "user reviews: [%d/%d] %s#%s: skipped (fetch returned no payload) in %.1fs",
+                    completed,
+                    total,
+                    repo_full,
+                    pr_item.get("number"),
+                    elapsed,
+                )
                 stats.skipped += 1
                 continue
             with transaction(conn):
@@ -176,6 +195,16 @@ def ingest_reviews(
                     payload=payload,
                     keep_only_login=username,
                 )
+            log.info(
+                "user reviews: [%d/%d] %s#%s: %d review + %d issue comments in %.1fs",
+                completed,
+                total,
+                repo_full,
+                pr_item.get("number"),
+                len(payload.review_comments),
+                len(payload.issue_comments),
+                elapsed,
+            )
 
     if newest_updated and stats.prs_seen > 0:
         q.set_cursor(conn, "reviews", _bump_iso(newest_updated), target_id=target_id)
@@ -532,6 +561,7 @@ class _RepoReviewRecords:
     repo_full: str
     payloads: list[_PrPayload] = field(default_factory=list)
     error: BaseException | None = None
+    elapsed_seconds: float = 0.0
 
 
 def _walk_repo_reviews(
@@ -544,6 +574,7 @@ def _walk_repo_reviews(
     """Worker: enumerate PRs above the cursor and fetch each PR's
     sub-endpoint payload. No DB or RawCache writes — pure fetch."""
     records = _RepoReviewRecords(repo_full=repo_full)
+    t0 = time.monotonic()
     try:
         for seen, pr_item in enumerate(
             _iter_prs_until_cursor(gh, repo_full=repo_full, cursor=cursor)
@@ -555,7 +586,18 @@ def _walk_repo_reviews(
                 records.payloads.append(payload)
     except GitHubError as e:
         records.error = e
+    records.elapsed_seconds = time.monotonic() - t0
     return records
+
+
+def _fetch_pr_payload_timed(
+    gh: GitHubClient, repo_full: str, pr_item: dict[str, Any]
+) -> tuple[_PrPayload | None, float]:
+    """User-mode worker wrapper: time the per-PR fetch without touching
+    `_fetch_pr_payload`'s signature."""
+    t0 = time.monotonic()
+    payload = _fetch_pr_payload(gh, repo_full, pr_item)
+    return payload, time.monotonic() - t0
 
 
 def ingest_reviews_org(
@@ -605,6 +647,8 @@ def ingest_reviews_org(
         return stats
 
     workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    total = len(to_walk)
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-reviews") as pool:
         futures = {
             pool.submit(
@@ -617,15 +661,29 @@ def ingest_reviews_org(
             for row in to_walk
         }
         for fut in as_completed(futures):
+            completed += 1
             row = futures[fut]
             try:
                 records = fut.result()
             except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
-                log.warning("worker %s crashed: %s", row["full_name"], e)
+                log.warning(
+                    "reviews org: [%d/%d] worker %s crashed: %s",
+                    completed,
+                    total,
+                    row["full_name"],
+                    e,
+                )
                 stats.skipped += 1
                 continue
             if records.error is not None:
-                log.warning("reviews fetch %s failed: %s", records.repo_full, records.error)
+                log.warning(
+                    "reviews org: [%d/%d] fetch %s failed in %.1fs: %s",
+                    completed,
+                    total,
+                    records.repo_full,
+                    records.elapsed_seconds,
+                    records.error,
+                )
                 stats.skipped += 1
                 continue
             with transaction(conn):
@@ -646,4 +704,16 @@ def ingest_reviews_org(
                     full_name=records.repo_full,
                     reviews_at=_now_iso(),
                 )
+            n_comments = sum(
+                len(p.review_comments) + len(p.issue_comments) for p in records.payloads
+            )
+            log.info(
+                "reviews org: [%d/%d] %s: %d PRs / %d comments in %.1fs",
+                completed,
+                total,
+                records.repo_full,
+                len(records.payloads),
+                n_comments,
+                records.elapsed_seconds,
+            )
     return stats

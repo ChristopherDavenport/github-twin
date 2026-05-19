@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -276,6 +277,7 @@ class _RepoRecords:
     head_sha: str
     commits: list[_CommitRecord] = field(default_factory=list)
     error: BaseException | None = None
+    elapsed_seconds: float = 0.0
 
 
 def _shallow_since_for(last_commits_at: str | None, cfg: IngestCfg) -> str:
@@ -339,6 +341,7 @@ def _walk_repo_records(
     """
     shallow_since = _shallow_since_for(last_commits_at, cfg)
     walk_since = _walk_since_for(last_commits_at, cfg)
+    t0 = time.monotonic()
     try:
         with commits_clone(
             repo_full,
@@ -378,9 +381,15 @@ def _walk_repo_records(
                         pre_chunks=pre_chunks,
                     )
                 )
+            records.elapsed_seconds = time.monotonic() - t0
             return records
     except (CloneError, OSError) as e:
-        return _RepoRecords(repo_full=repo_full, head_sha="", error=e)
+        return _RepoRecords(
+            repo_full=repo_full,
+            head_sha="",
+            error=e,
+            elapsed_seconds=time.monotonic() - t0,
+        )
 
 
 def _fetch_repo_pushed_at(
@@ -684,6 +693,8 @@ def _ingest_commits_local(
     sorted_emails = sorted({e.lower() for e in emails})
     token = gh.token
     workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    total = len(to_walk)
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-user-commits") as pool:
         futures = {
             pool.submit(
@@ -698,11 +709,18 @@ def _ingest_commits_local(
             for row in to_walk
         }
         for fut in as_completed(futures):
+            completed += 1
             row = futures[fut]
             try:
                 records = fut.result()
             except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
-                log.warning("worker %s crashed: %s", row["full_name"], e)
+                log.warning(
+                    "user commits: [%d/%d] worker %s crashed: %s",
+                    completed,
+                    total,
+                    row["full_name"],
+                    e,
+                )
                 stats.skipped += 1
                 continue
             pushed = pushed_at_by_repo.get(records.repo_full)
@@ -726,6 +744,15 @@ def _ingest_commits_local(
                 stats=stats,
                 resolve_author_login=False,
             )
+            if records.error is None:
+                log.info(
+                    "user commits: [%d/%d] %s: %d commits in %.1fs",
+                    completed,
+                    total,
+                    records.repo_full,
+                    len(records.commits),
+                    records.elapsed_seconds,
+                )
     return stats
 
 
@@ -844,6 +871,8 @@ def _ingest_commits_org_local(
 
     token = gh.token  # resolve once; pass to every worker
     workers = max(1, min(cfg.repo_concurrency, len(to_walk)))
+    total = len(to_walk)
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gt-commits") as pool:
         futures = {
             pool.submit(
@@ -857,11 +886,18 @@ def _ingest_commits_org_local(
             for row in to_walk
         }
         for fut in as_completed(futures):
+            completed += 1
             row = futures[fut]
             try:
                 records = fut.result()
             except BaseException as e:  # noqa: BLE001 — worker errors degrade gracefully
-                log.warning("worker %s crashed: %s", row["full_name"], e)
+                log.warning(
+                    "commits org: [%d/%d] worker %s crashed: %s",
+                    completed,
+                    total,
+                    row["full_name"],
+                    e,
+                )
                 stats.skipped += 1
                 continue
             # Refresh pushed_at on success too, so future syncs can fast-skip.
@@ -885,6 +921,15 @@ def _ingest_commits_org_local(
                 records=records,
                 stats=stats,
             )
+            if records.error is None:
+                log.info(
+                    "commits org: [%d/%d] %s: %d commits in %.1fs",
+                    completed,
+                    total,
+                    records.repo_full,
+                    len(records.commits),
+                    records.elapsed_seconds,
+                )
     return stats
 
 
