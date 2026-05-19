@@ -25,13 +25,17 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+from anyio.from_thread import run as run_from_thread
+from mcp.server.fastmcp import Context, FastMCP
 from opentelemetry.trace import Span
 
 from github_twin.config import Config, load_config
 from github_twin.embed import make_embedder
 from github_twin.eval.llm import make_text_llm
+from github_twin.mcp_server import bootstrap as bootstrap_mod
 from github_twin.mcp_server import tools as t
+from github_twin.mcp_server.bootstrap import BootstrapSpec
 from github_twin.mcp_server.tools import Scope
 from github_twin.observability import set_safe_attributes, tracer
 from github_twin.pipeline import run_embed, run_ingest
@@ -492,6 +496,96 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             )
             span.set_attribute("gh_twin.result.n_samples", result["n_samples"])
             span.set_attribute("gh_twin.result.from_cache", result["from_cache"])
+            return result
+
+    @mcp.tool()
+    def bootstrap_status() -> dict[str, Any]:
+        """Report whether this DB is ready for retrieval.
+
+        Returns:
+            db_initialized: True (the DB file always exists at startup; the
+                flag exists for symmetry with future remote backends).
+            targets: list of {kind, name} for every target in the DB.
+            stats: artifact / chunk / vector counts via `q.stats`.
+            in_progress: True when a `bootstrap` call is currently running.
+            recommendation: human-readable hint when the DB isn't usable yet;
+                None when retrieval will work.
+        """
+        with tracer().start_as_current_span("mcp.tool.bootstrap_status") as span:
+            payload = bootstrap_mod.status_payload(conn)
+            set_safe_attributes(
+                span,
+                **{
+                    "gh_twin.bootstrap.targets": len(payload["targets"]),
+                    "gh_twin.bootstrap.vectors": payload["stats"].get("vectors", 0),
+                    "gh_twin.bootstrap.in_progress": payload["in_progress"],
+                },
+            )
+            return payload
+
+    @mcp.tool()
+    async def bootstrap(
+        ctx: Context[Any, Any, Any],
+        kind: str | None = None,
+        name: str | None = None,
+        path: str | None = None,
+        keep_fork: bool = False,
+        skip_sync: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot setup: discover the target, ingest, embed.
+
+        Auto-detects repo-mode from the MCP server's cwd when `kind` is
+        unset. Streams phase-level progress notifications back to the
+        client; the final return value carries the saved target + stats.
+
+        Args:
+            kind: 'user' | 'org' | 'repo' | None (auto-detect from path/cwd).
+            name: user login, org login, or 'owner/name' (repo). Required
+                for `kind='org'` and `kind='user'` when not in this user's
+                token's identity; optional for `kind='repo'` when `path`
+                resolves to a github.com working tree.
+            path: filesystem path to walk for `.git/config`. Defaults to
+                the MCP server's cwd.
+            keep_fork: when the resolved repo is a fork, keep it instead
+                of swapping to upstream (default: swap).
+            skip_sync: stop after writing target/repo rows; caller invokes
+                `sync` later. Use this when you want fast first-call
+                feedback and will run the long ingest separately.
+        """
+        with tracer().start_as_current_span("mcp.tool.bootstrap") as span:
+            set_safe_attributes(
+                span,
+                **{
+                    "gh_twin.bootstrap.kind": kind,
+                    "gh_twin.bootstrap.name": name,
+                    "gh_twin.bootstrap.skip_sync": skip_sync,
+                    "gh_twin.bootstrap.keep_fork": keep_fork,
+                },
+            )
+            spec = BootstrapSpec(
+                kind=kind,
+                name=name,
+                path=Path(path) if path else None,
+                keep_fork=keep_fork,
+                skip_sync=skip_sync,
+            )
+            step = [0]
+
+            def sync_report(msg: str) -> None:
+                # Called from the worker thread spawned by to_thread.run_sync;
+                # from_thread.run schedules the async progress notification on
+                # the main event loop so MCP message ordering is preserved.
+                step[0] += 1
+                run_from_thread(ctx.report_progress, float(step[0]), None, msg)
+
+            def work() -> dict[str, Any]:
+                return bootstrap_mod.run_bootstrap(cfg, spec, report=sync_report)
+
+            result = await anyio.to_thread.run_sync(work)
+            span.set_attribute("gh_twin.bootstrap.ingested", bool(result.get("ingested")))
+            span.set_attribute(
+                "gh_twin.bootstrap.chunks_total", result.get("stats", {}).get("vectors", 0)
+            )
             return result
 
     @mcp.tool()

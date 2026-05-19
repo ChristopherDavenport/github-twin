@@ -153,6 +153,22 @@ def _find_git_root(start: Path) -> Path | None:
     return None
 
 
+def read_origin_owner_name(start_path: Path | None = None) -> tuple[str, str] | None:
+    """Best-effort `(owner, name)` from `.git/config` origin URL at `start_path` or cwd.
+
+    Pure file I/O — no GitHub API calls — so cheap enough for synchronous
+    status probes (e.g. `bootstrap_status`). Returns None when there's no
+    `.git`, no `.git/config`, or the origin isn't a github.com URL.
+    """
+    root = _find_git_root(start_path or Path.cwd())
+    if root is None:
+        return None
+    config_path = root / ".git" / "config"
+    if not config_path.is_file():
+        return None
+    return _parse_origin_owner_name(config_path.read_text(encoding="utf-8", errors="replace"))
+
+
 def discover_repo(
     gh: GitHubClient,
     *,
