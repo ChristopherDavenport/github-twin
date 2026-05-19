@@ -285,7 +285,7 @@ class OllamaSynthesizer:
 def make_synthesizer(
     *,
     claude_model: str,
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = "gemini-3.1-flash-lite",
     ollama_model: str | None = None,
     prefer: str = "auto",
     system_prompt: str = SYSTEM_PROMPT,

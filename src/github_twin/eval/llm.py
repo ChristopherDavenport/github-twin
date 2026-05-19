@@ -101,7 +101,7 @@ class OllamaText:
 def make_text_llm(
     *,
     claude_model: str = "claude-sonnet-4-6",
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = "gemini-3.1-flash-lite",
     ollama_model: str = "llama3.2",
     prefer: str = "auto",
 ) -> TextLLM:
