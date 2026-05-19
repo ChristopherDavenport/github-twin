@@ -54,6 +54,7 @@ from github_twin.target import (
     load_targets,
     maybe_discover_repo,
     save_target,
+    swap_fork_to_upstream,
 )
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -249,18 +250,18 @@ def _swap_fork_to_upstream(
     *,
     keep_fork: bool,
 ) -> tuple[Target, dict[str, Any]]:
-    """If the discovered repo is a fork, re-run discovery against its parent
-    and return the upstream's (target, metadata). Returns the original pair
-    unchanged when `keep_fork` is true or no parent was reported."""
-    if keep_fork or parent_full_name is None:
-        return target, metadata
-    console.print(
-        f"[dim]{target.name} is a fork of {parent_full_name}; "
-        f"using upstream as the target so review comments and PRs are "
-        f"ingested. Pass --keep-fork to keep the fork instead.[/dim]"
+    """CLI adapter around `target.swap_fork_to_upstream` that routes the
+    swap notice through Rich console output."""
+    return swap_fork_to_upstream(
+        gh,
+        target,
+        metadata,
+        parent_full_name,
+        keep_fork=keep_fork,
+        report=lambda msg: console.print(
+            f"[dim]{msg.replace('keep_fork=true', '--keep-fork')}[/dim]"
+        ),
     )
-    new_target, new_metadata, _ = discover_repo(gh, repo=parent_full_name)
-    return new_target, new_metadata
 
 
 # ---------- Typer commands ----------

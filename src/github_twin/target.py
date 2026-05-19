@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -330,3 +331,32 @@ def maybe_discover_repo(
     except ValueError as exc:
         log.debug("repo auto-detect skipped: %s", exc)
         return None
+
+
+def swap_fork_to_upstream(
+    gh: GitHubClient,
+    target: Target,
+    metadata: dict[str, Any],
+    parent_full_name: str | None,
+    *,
+    keep_fork: bool,
+    report: Callable[[str], None] | None = None,
+) -> tuple[Target, dict[str, Any]]:
+    """If the discovered repo is a fork, re-run discovery against its parent
+    and return the upstream's (target, metadata). Returns the original pair
+    unchanged when `keep_fork` is true or no parent was reported.
+
+    Optional `report` callback gets a single human-readable line when a swap
+    happens; CLI passes a console-print adapter, MCP bootstrap passes a
+    Reporter that forwards to `ctx.report_progress`.
+    """
+    if keep_fork or parent_full_name is None:
+        return target, metadata
+    if report is not None:
+        report(
+            f"{target.name} is a fork of {parent_full_name}; using upstream as the "
+            f"target so review comments and PRs are ingested. Pass keep_fork=true to "
+            f"keep the fork instead."
+        )
+    new_target, new_metadata, _ = discover_repo(gh, repo=parent_full_name)
+    return new_target, new_metadata
