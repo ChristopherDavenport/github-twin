@@ -41,6 +41,39 @@ CODE_SNIPPET_MAX_LINES = 40
 DECISION_KINDS = ("approved", "changes_requested", "commented")
 
 
+class NeedsInitError(RuntimeError):
+    """Raised by retrieval tools when the DB has no embedded data yet.
+
+    FastMCP serializes raised exceptions as MCP error responses; the
+    string the client (Claude) sees names both the `bootstrap` MCP tool
+    and the CLI fallback so the LLM has an obvious next action.
+    """
+
+
+def _require_data(conn: sqlite3.Connection) -> None:
+    """Raise `NeedsInitError` if the DB has no embedded chunks.
+
+    Retrieval tools rely on `vec_chunk` rows. A populated DB with zero
+    vectors means either no target is configured, or ingest ran but
+    embed didn't; both states need bootstrap action and we surface the
+    right hint for each.
+    """
+    if conn.execute("SELECT 1 FROM vec_chunk LIMIT 1").fetchone() is not None:
+        return
+    has_target = conn.execute("SELECT 1 FROM target LIMIT 1").fetchone() is not None
+    if not has_target:
+        raise NeedsInitError(
+            "github-twin: no target configured for this DB. "
+            "Call the `bootstrap` MCP tool to auto-detect from cwd, "
+            "or run `gt init` then `gt sync` in a terminal."
+        )
+    raise NeedsInitError(
+        "github-twin: a target exists but no chunks are embedded yet. "
+        "Call the `bootstrap` MCP tool, "
+        "or run `gt sync` in a terminal."
+    )
+
+
 def _truncate(text: str, max_lines: int) -> str:
     lines = text.splitlines()
     if len(lines) <= max_lines:
@@ -135,6 +168,7 @@ def find_review_comments(
     """
     if not diff_hunk.strip():
         return []
+    _require_data(conn)
     target_id, repo, author_login = _resolve_scope(
         conn, scope=scope, target=target, repo=repo, author_login=author_login
     )
@@ -211,6 +245,7 @@ def find_style_examples(
     `target` narrows to one target; unset coalesces across all."""
     if not query.strip():
         return []
+    _require_data(conn)
     target_id, repo, author_login = _resolve_scope(
         conn, scope=scope, target=target, repo=repo, author_login=author_login
     )
@@ -297,7 +332,6 @@ def predict_review_outcome(
     `target` narrows to one target's PRs; without it coalesces with
     dedup (so a PR ingested under multiple targets contributes one vote).
     """
-    target_id = _lookup_target_id(conn, target)
     empty = {
         "prediction": "unknown",
         "confidence": 0.0,
@@ -308,6 +342,8 @@ def predict_review_outcome(
     }
     if not diff_or_summary.strip():
         return empty
+    _require_data(conn)
+    target_id = _lookup_target_id(conn, target)
     vec = _embed_one(embedder, diff_or_summary)
     with tracer().start_as_current_span("retrieval.vector_search") as span:
         set_safe_attributes(
@@ -395,6 +431,7 @@ def find_applicable_rules(
     """
     if not query.strip():
         return []
+    _require_data(conn)
     target_id = _lookup_target_id(conn, target)
     vec = _embed_one(embedder, query)
     hits = _hybrid(
@@ -452,6 +489,7 @@ def find_code(
     """
     if not query.strip():
         return []
+    _require_data(conn)
     target_id = _lookup_target_id(conn, target)
     vec = _embed_one(embedder, query)
     # Overscan when we'll post-filter by path glob.

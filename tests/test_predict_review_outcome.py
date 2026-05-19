@@ -124,6 +124,34 @@ def _seed_pr(
 
 
 def test_predict_returns_unknown_when_no_pr_summaries(conn):
+    """DB has embedded chunks of other kinds but no `pr_summary` chunks —
+    the precheck passes (vectors exist) and the tool returns its
+    empty-shape "unknown" dict instead of raising NeedsInitError."""
+    # Seed one non-pr_summary chunk + vector so `_require_data` passes.
+    aid = q.upsert_artifact(
+        conn,
+        target_id=1,
+        kind="commit",
+        external_id="c-0",
+        source_url=None,
+        repo="me/x",
+        language="python",
+        author_email=None,
+        author_login=None,
+        created_at=None,
+        decision=None,
+        meta=None,
+    )
+    cid = q.insert_chunk(
+        conn,
+        artifact_id=aid,
+        kind="code",
+        text="def f(): return 1",
+        context={"path": "a.py"},
+        language="python",
+    )
+    q.write_embedding(conn, chunk_id=cid, embedding=[0.0, 0.0, 1.0, 0.0], model_id="fake")
+
     emb = FakeEmbedder()
     out = t.predict_review_outcome(conn, emb, SqliteVecStore(conn), diff_or_summary="A something")
     assert out["prediction"] == "unknown"
