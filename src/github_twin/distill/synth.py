@@ -225,8 +225,11 @@ class GeminiSynthesizer:
     def synthesize(self, cluster: list[dict[str, Any]]) -> RuleResult:
         from google.genai import types
 
+        from github_twin.gemini_client import make_thinking_config, with_retry
+
         user_msg = _render_cluster_for_prompt(cluster)
-        resp = self._client.models.generate_content(
+        resp = with_retry(
+            self._client.models.generate_content,
             model=self.model,
             contents=user_msg,
             config=types.GenerateContentConfig(
@@ -234,6 +237,7 @@ class GeminiSynthesizer:
                 response_mime_type="application/json",
                 temperature=0.2,
                 max_output_tokens=512,
+                thinking_config=make_thinking_config(self.model),
             ),
         )
         text = resp.text or ""
