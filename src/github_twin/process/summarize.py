@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from collections.abc import Callable, Iterable
 
 from github_twin.eval.llm import TextLLM
@@ -156,6 +157,7 @@ def summarize_chunks(
     report(f"summarizing {cap} chunks (kinds={list(kinds)}) with {llm.backend_id}")
 
     done = 0
+    t_start = time.monotonic()
     for chunk in _take(q.pending_summary_chunks(conn, kinds=kinds, batch_size=batch_size), cap):
         try:
             system, user = _prompt_for(chunk)
@@ -173,7 +175,16 @@ def summarize_chunks(
             q.write_chunk_summary(conn, chunk_id=chunk.id, summary=summary)
         done += 1
         if done % 25 == 0 or done == cap:
-            report(f"  ... {done}/{cap}")
+            elapsed = time.monotonic() - t_start
+            rate = done / elapsed if elapsed > 0 else 0.0
+            pct = (done / cap * 100.0) if cap else 0.0
+            eta_str = (
+                f", ETA ~{_fmt_duration((cap - done) / rate)}" if rate > 0 and done < cap else ""
+            )
+            report(
+                f"  ... {done}/{cap}  ({pct:.1f}%, {rate:.2f} cps, "
+                f"{_fmt_duration(elapsed)} elapsed{eta_str})"
+            )
     report(f"summarized {done} chunks")
     return done
 
@@ -185,3 +196,14 @@ def _take(it: Iterable[q.ChunkRow], n: int) -> Iterable[q.ChunkRow]:
         if i >= n:
             return
         yield x
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Render a duration in compact human form: 12s, 4m54s, 7h40m."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    h, rem = divmod(s, 3600)
+    return f"{h}h{rem // 60:02d}m"
