@@ -169,7 +169,7 @@ class SummarizeCfg(BaseModel):
     # in a pinch (default in dev) but produces fuzzier summaries.
     ollama_model: str = "llama3.2"
     claude_model: str = "claude-haiku-4-5-20251001"
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.1-flash-lite"
     # Cap the per-chunk completion length (tokens). qwen3-family "thinking"
     # models consume budget on internal reasoning before emitting visible
     # output, so 200 headroom covers both classic and thinking models;
@@ -233,9 +233,11 @@ class DistillCfg(BaseModel):
     # Sonnet is the cost/quality sweet spot for ~20-50 cluster runs; bump to
     # claude-opus-4-7 if rules feel shallow.
     claude_model: str = "claude-sonnet-4-6"
-    # Flash is free-tier friendly and plenty for extraction; switch to
-    # "gemini-2.5-pro" for paid + best quality.
-    gemini_model: str = "gemini-2.5-flash"
+    # Flash-Lite is the cheap/fast extraction tier; switch to
+    # "gemini-3.1-pro" for paid + best quality. `make_thinking_config` in
+    # `gemini_client.py` pins reasoning to the floor so `max_output_tokens`
+    # is spent on visible JSON, not internal thinking tokens.
+    gemini_model: str = "gemini-3.1-flash-lite"
     ollama_model: str = "llama3.2"
     # 'auto' precedence: Claude -> Gemini -> Ollama, based on which API key is set.
     backend: str = "auto"
