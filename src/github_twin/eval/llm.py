@@ -59,13 +59,17 @@ class GeminiText:
     def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
         from google.genai import types
 
-        resp = self._client.models.generate_content(
+        from github_twin.gemini_client import make_thinking_config, with_retry
+
+        resp = with_retry(
+            self._client.models.generate_content,
             model=self.model,
             contents=user,
             config=types.GenerateContentConfig(
                 system_instruction=system,
                 temperature=0.2,
                 max_output_tokens=max_tokens,
+                thinking_config=make_thinking_config(self.model),
             ),
         )
         return resp.text or ""
