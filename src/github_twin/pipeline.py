@@ -56,6 +56,26 @@ EMBED_TEXT_VERSION = 4
 _EMBED_VERSION_KEY = "embed_text_version"
 
 
+# Backend-aware concurrency defaults for `gt summarize`, resolved when
+# `cfg.summarize.concurrency` is unset. Ollama is local (GPU/CPU-bound,
+# serialized internally) so concurrency adds no value; Claude and Gemini
+# are network-bound and benefit from parallel in-flight requests.
+# Gemini is held at 4 (not 8) so a free-tier key (10 RPM) doesn't drown
+# in 429s on the first `gt sync`; paid-tier users can pin higher via
+# `cfg.summarize.concurrency` or `--concurrency`.
+_DEFAULT_CONCURRENCY: dict[str, int] = {"gemini": 4, "claude": 4, "ollama": 1}
+
+
+def _resolve_summarize_concurrency(cfg_value: int | None, backend_id: str) -> int:
+    """`cfg.summarize.concurrency` if set, else the backend-aware default
+    keyed on the prefix of `backend_id` (e.g. 'gemini:gemini-2.5-flash'
+    -> 'gemini'). Unknown backends fall back to 1 to stay safe."""
+    if cfg_value is not None:
+        return cfg_value
+    prefix = backend_id.split(":", 1)[0]
+    return _DEFAULT_CONCURRENCY.get(prefix, 1)
+
+
 Reporter = Callable[[str], None]
 
 
@@ -249,12 +269,14 @@ def run_summarize(
             ollama_model=cfg.summarize.ollama_model,
             prefer=cfg.summarize.backend,
         )
+    concurrency = _resolve_summarize_concurrency(cfg.summarize.concurrency, llm.backend_id)
     return summarize_chunks(
         conn,
         llm,
         kinds=tuple(kinds) if kinds is not None else tuple(cfg.summarize.kinds),
         limit=limit,
         max_tokens=cfg.summarize.max_tokens,
+        concurrency=concurrency,
         report=report,
         rebuild=rebuild,
     )

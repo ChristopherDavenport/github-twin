@@ -8,6 +8,7 @@ model, and we want one place to assert the contract.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,14 +23,18 @@ from tests.conftest import seed_target
 @dataclass
 class FakeLLM:
     """Records every call; returns a canned response. Tests inspect
-    `.calls` to assert prompt shape per kind."""
+    `.calls` to assert prompt shape per kind. `delay` simulates a slow
+    network backend so the concurrent-pool tests can verify parallelism."""
 
     backend_id: str = "fake"
     response: str = "Validates auth headers and dispatches to the right handler."
     calls: list[tuple[str, str]] = field(default_factory=list)
     raise_on_call: Exception | None = None
+    delay: float = 0.0
 
     def complete(self, *, system: str, user: str, max_tokens: int = 512) -> str:
+        if self.delay:
+            time.sleep(self.delay)
         self.calls.append((system, user))
         if self.raise_on_call:
             raise self.raise_on_call
@@ -287,3 +292,93 @@ def test_clean_summary_caps_length():
 def test_clean_summary_empty_input_returns_empty():
     assert _clean_summary("") == ""
     assert _clean_summary("   ") == ""
+
+
+# ---------- concurrency ----------
+
+
+def test_concurrent_run_writes_all_chunks(conn):
+    """With concurrency > 1, every chunk should still get a summary.
+    Arrival order is non-deterministic, so we compare on a set."""
+    ids = [
+        _seed_code(conn, text=f"def f{i}(): return {i}", symbol=f"f{i}", path=f"src/{i}.py")
+        for i in range(6)
+    ]
+    llm = FakeLLM(response="Returns a constant.")
+    n = summarize_chunks(conn, llm, concurrency=4)
+    assert n == 6
+    rows = conn.execute(
+        "SELECT id, summary FROM chunk WHERE id IN (?, ?, ?, ?, ?, ?)", ids
+    ).fetchall()
+    by_id = {r["id"]: r["summary"] for r in rows}
+    assert set(by_id.keys()) == set(ids)
+    assert all(s == "Returns a constant." for s in by_id.values())
+
+
+def test_concurrent_run_parallelizes_llm_calls(conn):
+    """Wall clock should be meaningfully under (n * delay) when concurrency
+    > 1. Loose bound (60% of serial) absorbs CI noise while still proving
+    that calls overlap."""
+    for i in range(8):
+        _seed_code(conn, text=f"def g{i}(): pass", symbol=f"g{i}", path=f"src/g{i}.py")
+    delay = 0.05
+    llm = FakeLLM(delay=delay)
+    t0 = time.monotonic()
+    n = summarize_chunks(conn, llm, concurrency=4)
+    elapsed = time.monotonic() - t0
+    assert n == 8
+    # Serial would be >= 8 * 0.05 = 0.40s. With concurrency=4 we expect
+    # roughly 2 * 0.05 = 0.10s; allow generous headroom up to 0.24s.
+    assert elapsed < 8 * delay * 0.6, f"expected parallel speedup, got {elapsed:.3f}s"
+
+
+def test_concurrent_run_isolates_per_chunk_failures(conn):
+    """One worker raising must not abort the rest. The failed chunk stays
+    NULL; others land. Uses a thread-safe counter to fail exactly one
+    call regardless of which thread it lands on."""
+    ids = [
+        _seed_code(conn, text=f"def h{i}(): pass", symbol=f"h{i}", path=f"src/h{i}.py")
+        for i in range(6)
+    ]
+    llm = FakeLLM(response="ok.")
+    import threading
+
+    lock = threading.Lock()
+    state = {"n": 0}
+    original_complete = llm.complete
+
+    def flaky(*, system, user, max_tokens=512):
+        with lock:
+            state["n"] += 1
+            should_raise = state["n"] == 3
+        if should_raise:
+            raise RuntimeError("simulated model failure")
+        return original_complete(system=system, user=user, max_tokens=max_tokens)
+
+    llm.complete = flaky  # type: ignore[method-assign]
+    n = summarize_chunks(conn, llm, concurrency=4)
+    assert n == 5
+    rows = conn.execute(
+        "SELECT id, summary FROM chunk WHERE id IN (?, ?, ?, ?, ?, ?)", ids
+    ).fetchall()
+    populated = [r for r in rows if r["summary"] is not None]
+    null = [r for r in rows if r["summary"] is None]
+    assert len(populated) == 5
+    assert len(null) == 1
+
+
+def test_concurrent_run_honors_limit(conn):
+    """With limit=3 and 10 pending at concurrency=4, only 3 summaries
+    should be written and at most 3 + (concurrency - 1) extra in-flight
+    submissions should occur. In practice the streaming pool short-
+    circuits at exactly `limit` calls because `_take` enforces the cap
+    on the upstream generator."""
+    for i in range(10):
+        _seed_code(conn, text=f"def k{i}(): pass", symbol=f"k{i}", path=f"src/k{i}.py")
+    llm = FakeLLM()
+    n = summarize_chunks(conn, llm, limit=3, concurrency=4)
+    assert n == 3
+    # _take caps the iterator at 3, so the pool sees at most 3 chunks.
+    assert len(llm.calls) == 3
+    pending = conn.execute("SELECT COUNT(*) AS n FROM chunk WHERE summary IS NULL").fetchone()
+    assert pending["n"] == 7

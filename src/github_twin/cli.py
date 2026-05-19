@@ -769,6 +769,14 @@ def summarize(
         "--model",
         help="Override the Ollama model (cfg.summarize.ollama_model). Ignored for cloud backends.",
     ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=(
+            "Parallel LLM requests. Default: auto (1 ollama, 4 claude, 4 gemini). "
+            "Pin an int to override; bounded to [1, 64]."
+        ),
+    ),
     rebuild: bool = typer.Option(
         False,
         "--rebuild",
@@ -788,6 +796,12 @@ def summarize(
         cfg = cfg.model_copy(
             update={
                 "summarize": cfg.summarize.model_copy(update={"ollama_model": model}),
+            }
+        )
+    if concurrency is not None:
+        cfg = cfg.model_copy(
+            update={
+                "summarize": cfg.summarize.model_copy(update={"concurrency": concurrency}),
             }
         )
     kinds = tuple(kind) if kind else None
