@@ -49,6 +49,7 @@ def open_db(db_path: Path, embed_dim: int) -> sqlite3.Connection:
         conn.executescript(f.read())
     _ensure_vec_table(conn, embed_dim)
     _migrate_artifact_columns(conn)
+    _migrate_repo_columns(conn)
     _backfill_fts(conn)
     return conn
 
@@ -63,6 +64,14 @@ def _migrate_artifact_columns(conn: sqlite3.Connection) -> None:
     have = {row["name"] for row in conn.execute("PRAGMA table_info(artifact)").fetchall()}
     if "content_hash" not in have:
         conn.execute("ALTER TABLE artifact ADD COLUMN content_hash TEXT")
+
+
+def _migrate_repo_columns(conn: sqlite3.Connection) -> None:
+    """Backfill columns onto pre-existing `repo` tables. Same pattern as
+    `_migrate_artifact_columns`: PRAGMA table_info + ALTER on miss."""
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(repo)").fetchall()}
+    if "visibility" not in have:
+        conn.execute("ALTER TABLE repo ADD COLUMN visibility TEXT")
 
 
 def _backfill_fts(conn: sqlite3.Connection) -> None:

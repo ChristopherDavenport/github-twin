@@ -369,7 +369,17 @@ Embeddings never go to a remote API. The LLM seam (`distill`,
   - `repo` kind is a single-repo scope (`name='owner/name'`); the pipeline
     treats it as org-mode-with-one-repo so `ingest_files` /
     `ingest_commits_org` / `ingest_reviews_org` are reused unchanged.
-- `repo` table populated in org mode and repo mode (one row in repo mode)
+- `repo` table populated in org mode and repo mode (one row in repo mode).
+  `repo.archived` and `repo.visibility ∈ {public, private, internal, NULL}`
+  are stamped from the GitHub `/orgs/{org}/repos` response. `gt sync`
+  re-runs `enumerate_org_repos` (always with `include_archived=True`)
+  before ingest so a repo that flipped to archived after `gt init` gets
+  its row refreshed — downstream `q.list_repos(include_archived=False)`
+  (the default at every ingest read site) then naturally excludes it.
+  Opt back in with `--include-archived` on `gt init` / `gt sync` or
+  `ingest.include_archived = true` in `config.toml`. "Internal-archived"
+  repos (`visibility=internal` AND `archived=true`) are caught by the
+  archived filter — no separate visibility flag.
 - `artifact.decision` is set only in user mode; org-mode equivalent is
   `meta.reviewer_decisions = [{login, state, submitted_at}]`
 - `artifact.author_login` is populated by org-mode ingest; user-mode leaves
@@ -398,11 +408,14 @@ Embeddings never go to a remote API. The LLM seam (`distill`,
 ~/.local/bin/uv run gt stats
 ~/.local/bin/uv run gt sync                    # incremental ingest + summarize + embed + wiki export
 ~/.local/bin/uv run gt sync --skip-wiki        # skip the scratch-note ingest + vault export
+~/.local/bin/uv run gt sync --include-archived # let archived repos through this run
 ~/.local/bin/uv run gt summarize               # standalone (cfg.summarize backend)
 ~/.local/bin/uv run gt wiki export             # one-shot: re-render the markdown vault from the DB
 
 # org-mode (fresh data dir)
 GT_PATHS__DATA_DIR=./data-org uv run gt init --kind org --org <name>
+# --include-archived: keep archived repos (also catches internal-archived).
+GT_PATHS__DATA_DIR=./data-org uv run gt init --kind org --org <name> --include-archived
 GT_PATHS__DATA_DIR=./data-org uv run gt ingest
 GT_PATHS__DATA_DIR=./data-org uv run gt embed
 

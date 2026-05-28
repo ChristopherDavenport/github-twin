@@ -129,6 +129,9 @@ class BootstrapSpec:
       swapping to upstream (default: swap, matching `gt init`).
     - `skip_sync`: stop after writing target/repo rows. Lets the client
       kick off a fast init and invoke `sync` later.
+    - `include_archived`: include archived repos in org enumeration
+      (default: skip them, catching internal-archived too). Overrides
+      `cfg.ingest.include_archived`.
     """
 
     kind: str | None = None
@@ -136,6 +139,7 @@ class BootstrapSpec:
     path: Path | None = None
     keep_fork: bool = False
     skip_sync: bool = False
+    include_archived: bool = False
 
 
 def init_target(
@@ -185,11 +189,15 @@ def init_target(
     if kind == "org":
         if not spec.name:
             raise ValueError("kind='org' requires `name` (the org login)")
+        keep_archived = spec.include_archived or cfg.ingest.include_archived
         target = discover_org(gh, spec.name)
         with transaction(conn):
             target = save_target(conn, target)
         assert target.id is not None
-        report(f"added org target {target.name}; enumerating repos...")
+        report(
+            f"added org target {target.name}; enumerating repos "
+            f"(include_archived={keep_archived})..."
+        )
         n_kept = 0
         with transaction(conn):
             for r in enumerate_org_repos(
@@ -197,6 +205,7 @@ def init_target(
                 target.name,
                 include=cfg.ingest.include_repos,
                 exclude=cfg.ingest.exclude_repos,
+                include_archived=keep_archived,
             ):
                 q.upsert_repo(conn, target_id=target.id, **r)
                 n_kept += 1

@@ -469,6 +469,61 @@ def test_repo_upsert_and_list(conn):
     assert {r["full_name"] for r in repos} == {"org/r1", "org/r2", "org/r3"}
 
 
+def test_repo_visibility_round_trips(conn):
+    q.upsert_repo(
+        conn,
+        target_id=1,
+        full_name="org/internal",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        visibility="internal",
+    )
+    q.upsert_repo(
+        conn,
+        target_id=1,
+        full_name="org/legacy",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        # visibility omitted — defaults to None / NULL (older GHE responses).
+    )
+    row_internal = q.get_repo(conn, target_id=1, full_name="org/internal")
+    assert row_internal is not None
+    assert row_internal["visibility"] == "internal"
+    row_legacy = q.get_repo(conn, target_id=1, full_name="org/legacy")
+    assert row_legacy is not None
+    assert row_legacy["visibility"] is None
+
+
+def test_repo_upsert_refreshes_archived_and_visibility(conn):
+    """Sync re-upserts with fresh GitHub state; existing row's columns flip."""
+    q.upsert_repo(
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        archived=False,
+        visibility="public",
+    )
+    # `gt sync` refresh sees the repo is now archived and internal.
+    q.upsert_repo(
+        conn,
+        target_id=1,
+        full_name="org/r",
+        default_branch="main",
+        pushed_at="2024-05-01T00:00:00Z",
+        archived=True,
+        visibility="internal",
+    )
+    row = q.get_repo(conn, target_id=1, full_name="org/r")
+    assert row is not None
+    assert row["archived"] == 1
+    assert row["visibility"] == "internal"
+    # `list_repos` default now excludes it.
+    assert [r["full_name"] for r in q.list_repos(conn)] == []
+    assert [r["full_name"] for r in q.list_repos(conn, include_archived=True)] == ["org/r"]
+
+
 def test_set_repo_cursor_is_partial(conn):
     q.upsert_repo(
         conn,
@@ -485,6 +540,54 @@ def test_set_repo_cursor_is_partial(conn):
     r = q.get_repo(conn, target_id=1, full_name="org/r")
     assert r["last_files_at"] == "2024-01-02T00:00:00Z"
     assert r["last_commits_at"] == "2024-01-03T00:00:00Z"
+
+
+def test_open_db_migrates_repo_visibility_column(tmp_path: Path):
+    """An old DB created before the `visibility` column gets it back-filled
+    as NULL on the next open, with existing rows untouched."""
+    db_path = tmp_path / "legacy.sqlite"
+    db = open_db(db_path, embed_dim=4)
+    try:
+        # Drop visibility to simulate a pre-migration DB, then re-open.
+        db.execute(
+            "CREATE TABLE repo_legacy AS "
+            "SELECT target_id, full_name, default_branch, head_sha, pushed_at, "
+            "archived, fork, size_kb, last_files_at, last_commits_at, "
+            "last_commits_walked_sha, last_reviews_at FROM repo"
+        )
+        db.execute("DROP TABLE repo")
+        db.execute(
+            "CREATE TABLE repo ("
+            "target_id INTEGER NOT NULL REFERENCES target(id) ON DELETE CASCADE,"
+            "full_name TEXT NOT NULL,"
+            "default_branch TEXT,"
+            "head_sha TEXT,"
+            "pushed_at TEXT,"
+            "archived INTEGER NOT NULL DEFAULT 0,"
+            "fork INTEGER NOT NULL DEFAULT 0,"
+            "size_kb INTEGER,"
+            "last_files_at TEXT,"
+            "last_commits_at TEXT,"
+            "last_commits_walked_sha TEXT,"
+            "last_reviews_at TEXT,"
+            "PRIMARY KEY (target_id, full_name))"
+        )
+        seed_target(db)
+        db.execute(
+            "INSERT INTO repo (target_id, full_name, default_branch, pushed_at) "
+            "VALUES (1, 'org/legacy', 'main', '2024-01-01T00:00:00Z')"
+        )
+    finally:
+        db.close()
+
+    db = open_db(db_path, embed_dim=4)
+    try:
+        cols = {row["name"] for row in db.execute("PRAGMA table_info(repo)").fetchall()}
+        assert "visibility" in cols
+        row = db.execute("SELECT visibility FROM repo WHERE full_name = 'org/legacy'").fetchone()
+        assert row["visibility"] is None
+    finally:
+        db.close()
 
 
 def test_open_db_rejects_wrong_dim(tmp_path: Path):

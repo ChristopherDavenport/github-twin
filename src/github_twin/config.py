@@ -109,6 +109,15 @@ class IngestCfg(BaseModel):
     since: str = "2018-01-01"
     include_repos: list[str] = Field(default_factory=list)
     exclude_repos: list[str] = Field(default_factory=list)
+    # When False (default), `enumerate_org_repos` drops archived repos at
+    # init so they never enter the DB, and `q.list_repos` (called by every
+    # ingest read site) excludes them at sync time. The `gt sync` refresh
+    # step always fetches all repos from GitHub so the `archived` /
+    # `visibility` columns stay current; this knob only controls whether
+    # downstream ingest reads them. "Internal archived" repos (GitHub
+    # `visibility=internal` AND `archived=true`) are caught by the archived
+    # filter — no separate visibility flag.
+    include_archived: bool = False
     # Patterns matched with `fnmatch.fnmatch`, where `*` matches any
     # character including `/` — so `*foo*` catches `foo` at any depth and
     # the historical `**/foo/**` form misses top-level `foo/`. Patterns

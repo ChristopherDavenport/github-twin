@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS repo (
   head_sha                TEXT,              -- last indexed default-branch SHA
   pushed_at               TEXT,              -- from /repos response; skip if <= last_files_at
   archived                INTEGER NOT NULL DEFAULT 0,
+  visibility              TEXT,              -- 'public' | 'private' | 'internal' | NULL (older GHE / unknown)
   fork                    INTEGER NOT NULL DEFAULT 0,
   size_kb                 INTEGER,
   last_files_at           TEXT,              -- last successful file walk

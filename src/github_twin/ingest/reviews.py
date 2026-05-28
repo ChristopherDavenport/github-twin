@@ -616,7 +616,7 @@ def ingest_reviews_org(
     write). Per-repo cursor is `last_reviews_at`; advance after each repo
     in its own transaction so partial failures don't roll back peers."""
     stats = ReviewStats()
-    all_repos = q.list_repos(conn, target_id=target_id)
+    all_repos = q.list_repos(conn, target_id=target_id, include_archived=cfg.include_archived)
     allowed = [r for r in all_repos if _allowed_repo(r["full_name"], cfg)]
     if not allowed:
         return stats

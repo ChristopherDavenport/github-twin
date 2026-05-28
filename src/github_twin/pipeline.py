@@ -92,7 +92,11 @@ def _prefetch_pushed_at(
     """One pass over `/repos/{r}` per sync, shared by commits + reviews legs."""
     repos = [
         r["full_name"]
-        for r in q.list_repos(conn, target_id=target_id)
+        for r in q.list_repos(
+            conn,
+            target_id=target_id,
+            include_archived=cfg.ingest.include_archived,
+        )
         if _allowed_repo(r["full_name"], cfg.ingest)
     ]
     if not repos:

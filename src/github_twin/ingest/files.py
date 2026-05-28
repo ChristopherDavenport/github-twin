@@ -102,7 +102,7 @@ def ingest_files(
     limit: int | None = None,
 ) -> FilesStats:
     stats = FilesStats()
-    repos = q.list_repos(conn, target_id=target_id)
+    repos = q.list_repos(conn, target_id=target_id, include_archived=cfg.include_archived)
     if limit is not None:
         repos = repos[:limit]
     cache_dir: Path | None = Path(cfg.clones_dir) if cfg.cache_clones and cfg.clones_dir else None
