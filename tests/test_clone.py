@@ -241,6 +241,108 @@ def test_fetch_update_propagates_other_clone_errors(monkeypatch, tmp_path: Path)
         clone_mod._fetch_update(path, "org/repo", "tkn", depth=1, shallow_since="2026-05-26")
 
 
+def test_resolve_origin_head_uses_symbolic_ref(monkeypatch, tmp_path: Path):
+    """Happy path: `git symbolic-ref refs/remotes/origin/HEAD` resolves cleanly."""
+
+    def fake_git(args, *, cwd=None):
+        if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+            return "refs/remotes/origin/main"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    assert clone_mod._resolve_origin_head(tmp_path, "org/repo") == "origin/main"
+
+
+def test_resolve_origin_head_falls_back_to_single_branch(monkeypatch, tmp_path: Path):
+    """When `origin/HEAD` isn't a symbolic ref, fall back to the single tracked
+    branch under `refs/remotes/origin/`. Reproduces the prod warning:
+        'walk org/repo failed, skipping: git symbolic-ref refs/remotes/origin/HEAD
+         failed (128): fatal: ref refs/remotes/origin/HEAD is not a symbolic ref'
+    """
+
+    def fake_git(args, *, cwd=None):
+        if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+            raise clone_mod.CloneError(
+                "git symbolic-ref refs/remotes/origin/HEAD failed (128): "
+                "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref"
+            )
+        if args[0] == "for-each-ref":
+            return "refs/remotes/origin/develop"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    assert clone_mod._resolve_origin_head(tmp_path, "org/repo") == "origin/develop"
+
+
+def test_resolve_origin_head_fallback_skips_head_entry(monkeypatch, tmp_path: Path):
+    """`for-each-ref refs/remotes/origin/` includes 'refs/remotes/origin/HEAD'
+    when present as a plain (non-symbolic) ref; the fallback must skip it
+    so we don't reset to a self-referential pseudo-branch.
+    """
+
+    def fake_git(args, *, cwd=None):
+        if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+            raise clone_mod.CloneError("not a symbolic ref")
+        if args[0] == "for-each-ref":
+            return "refs/remotes/origin/HEAD\nrefs/remotes/origin/trunk"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    assert clone_mod._resolve_origin_head(tmp_path, "org/repo") == "origin/trunk"
+
+
+def test_resolve_origin_head_raises_when_no_branches(monkeypatch, tmp_path: Path):
+    """If neither path yields a branch, surface a clear CloneError instead of
+    resetting to an empty short-ref (which would silently `git reset --hard`
+    to nothing)."""
+
+    def fake_git(args, *, cwd=None):
+        if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+            raise clone_mod.CloneError("not a symbolic ref")
+        if args[0] == "for-each-ref":
+            return ""
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    with pytest.raises(clone_mod.CloneError, match="no remote-tracking branches"):
+        clone_mod._resolve_origin_head(tmp_path, "org/repo")
+
+
+def test_fetch_update_recovers_when_origin_head_not_symbolic(monkeypatch, tmp_path: Path):
+    """End-to-end: a fetch whose `symbolic-ref refs/remotes/origin/HEAD` fails
+    must still reset to the tracked branch and return the new HEAD, not abort
+    the whole repo walk.
+    """
+    path = tmp_path / "repo"
+    path.mkdir()
+    reset_targets: list[str] = []
+
+    def fake_git(args, *, cwd=None):
+        cmd = args[0]
+        if cmd == "remote" and args[1] == "set-url":
+            return ""
+        if cmd == "fetch":
+            return ""
+        if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+            raise clone_mod.CloneError(
+                "git symbolic-ref refs/remotes/origin/HEAD failed (128): "
+                "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref"
+            )
+        if cmd == "for-each-ref":
+            return "refs/remotes/origin/master"
+        if cmd == "reset":
+            reset_targets.append(args[-1])
+            return ""
+        if cmd == "rev-parse" and args[1] == "HEAD":
+            return "cafebabe"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    head = clone_mod._fetch_update(path, "org/repo", "tkn", depth=1, shallow_since="2026-05-26")
+    assert head == "cafebabe"
+    assert reset_targets == ["origin/master"]
+
+
 def test_git_decodes_non_utf8_output_with_replacement(monkeypatch, tmp_path: Path):
     """`git show` of a diff containing non-UTF-8 bytes must not crash _git.
 

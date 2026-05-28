@@ -150,6 +150,40 @@ def _is_shallow(path: Path) -> bool:
     return _git(["rev-parse", "--is-shallow-repository"], cwd=path) == "true"
 
 
+def _resolve_origin_head(path: Path, full_name: str) -> str:
+    """Return the short remote-tracking branch to reset to ('origin/<branch>').
+
+    Prefers `git symbolic-ref refs/remotes/origin/HEAD`, but that ref isn't
+    always a symbolic ref — older clones, or clones whose HEAD was never
+    initialised by the server, can leave it as a plain ref or absent entirely.
+    Since we always clone with `--single-branch`, falling back to the only
+    tracked branch under `refs/remotes/origin/` is unambiguous.
+    """
+    try:
+        head_ref = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=path)
+        # 'refs/remotes/origin/main' → 'origin/main'
+        return head_ref.replace("refs/remotes/", "", 1)
+    except CloneError:
+        pass
+    # Fallback: enumerate remote-tracking branches; with --single-branch this is
+    # exactly one entry. `for-each-ref` prints e.g. 'refs/remotes/origin/main'.
+    listing = _git(
+        ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/"],
+        cwd=path,
+    )
+    branches = [
+        line.replace("refs/remotes/", "", 1)
+        for line in listing.splitlines()
+        if line.strip() and not line.endswith("/HEAD")
+    ]
+    if not branches:
+        raise CloneError(
+            f"{full_name}: no remote-tracking branches under refs/remotes/origin/ "
+            "after fetch; cannot determine default branch"
+        )
+    return branches[0]
+
+
 def _fetch_update(
     path: Path,
     full_name: str,
@@ -202,9 +236,7 @@ def _fetch_update(
             _git(["fetch", "--depth", str(depth), "--no-tags", "origin"], cwd=path)
         # default branch may differ from where the local checkout points; we
         # reset hard to whatever origin/HEAD is now.
-        head_ref = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=path)
-        # 'refs/remotes/origin/main' → 'origin/main'
-        short = head_ref.replace("refs/remotes/", "", 1)
+        short = _resolve_origin_head(path, full_name)
         _git(["reset", "--hard", short], cwd=path)
     finally:
         _scrub_remote(path, full_name)
