@@ -339,6 +339,16 @@ def init(
             "--kind=repo and the --kind=auto .git-detect path."
         ),
     ),
+    include_archived: bool = typer.Option(
+        False,
+        "--include-archived",
+        help=(
+            "Keep archived repos when enumerating an org. Default: skip them. "
+            "Catches internal-archived too (those are also `archived=true`). "
+            "Overrides `ingest.include_archived` in config.toml. No effect on "
+            "--kind=repo: explicitly-named single repos are always persisted."
+        ),
+    ),
     config: Path | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Add a target (user / org / repo) to this DB.
@@ -396,6 +406,7 @@ def init(
         if not org:
             console.print("[red]--org is required when --kind=org[/red]")
             raise typer.Exit(2)
+        keep_archived = include_archived or cfg.ingest.include_archived
         with GitHubClient() as gh:
             target = discover_org(gh, org)
             with transaction(conn):
@@ -405,7 +416,8 @@ def init(
             console.print(
                 f"Discovering repos in {target.name} "
                 f"(include={cfg.ingest.include_repos or '*'}, "
-                f"exclude={cfg.ingest.exclude_repos or 'none'})…"
+                f"exclude={cfg.ingest.exclude_repos or 'none'}, "
+                f"include_archived={keep_archived})…"
             )
             n_kept = 0
             with transaction(conn):
@@ -414,6 +426,7 @@ def init(
                     target.name,
                     include=cfg.ingest.include_repos,
                     exclude=cfg.ingest.exclude_repos,
+                    include_archived=keep_archived,
                 ):
                     q.upsert_repo(conn, target_id=target.id, **r)
                     n_kept += 1
@@ -821,6 +834,16 @@ def sync(
         "--skip-wiki",
         help="Don't ingest scratch notes or export the wiki vault.",
     ),
+    include_archived: bool = typer.Option(
+        False,
+        "--include-archived",
+        help=(
+            "Let downstream ingest pick up archived repos for this run. "
+            "Overrides `ingest.include_archived` in config.toml. The org-repo "
+            "metadata refresh always fetches all repos so `archived` and "
+            "`visibility` stay current regardless of this flag."
+        ),
+    ),
     target: str | None = typer.Option(
         None, "--target", help="Restrict to one target (by name). Default: all."
     ),
@@ -831,6 +854,11 @@ def sync(
     Without `--target`, iterates every target in the DB and runs ingest
     for each. Summarize + embed are corpus-wide and run once at the end.
 
+    Before ingest, org-mode (and repo-mode) targets get their `repo` rows
+    refreshed from GitHub so the `archived` / `visibility` columns reflect
+    current state — a repo archived between syncs drops out of subsequent
+    ingest via `q.list_repos(include_archived=False)`.
+
     Wiki round-trip (skip with `--skip-wiki`):
     - Before GitHub ingest: scratch-note ingest (`<vault>/scratch/*.md`
       → `kind='note'` artifacts).
@@ -838,10 +866,14 @@ def sync(
       under `<vault_root>` so the disk view tracks the DB.
     """
     cfg, conn = _ctx(config)
+    if include_archived:
+        cfg.ingest.include_archived = True
     target_filter = _resolve_target_arg(conn, target)
 
     if not skip_wiki and cfg.wiki.enabled:
         _ingest_scratch_notes(cfg, conn, target_filter=target_filter)
+
+    _refresh_known_repos(cfg, conn, target_filter=target_filter)
 
     _run_ingest_safely(
         cfg,
@@ -862,6 +894,47 @@ def sync(
             conn,
             target=target_filter.name if target_filter else None,
         )
+
+
+def _refresh_known_repos(
+    cfg: Config, conn: sqlite3.Connection, *, target_filter: Target | None
+) -> None:
+    """Refresh `archived` and `visibility` on every org-mode target's `repo`
+    rows from GitHub before ingest.
+
+    Why: `enumerate_org_repos` runs once at `gt init` time, so a repo that
+    gets archived later keeps `archived=0` in the DB and slips through
+    `q.list_repos(include_archived=False)`. Re-enumerating each sync flips
+    those flags so downstream ingest naturally excludes them.
+
+    Always passes `include_archived=True` to the enumerator so newly-archived
+    repos still get their row updated; whether they then get ingested is
+    governed by `cfg.ingest.include_archived` at the read sites.
+
+    User-mode and repo-mode targets are skipped (no org enumeration to do).
+    """
+    targets = [target_filter] if target_filter else load_targets(conn)
+    org_targets = [t for t in targets if t.kind == "org" and t.id is not None]
+    if not org_targets:
+        return
+    with GitHubClient() as gh:
+        for t in org_targets:
+            assert t.id is not None
+            n_refreshed = 0
+            with transaction(conn):
+                for r in enumerate_org_repos(
+                    gh,
+                    t.name,
+                    include=cfg.ingest.include_repos,
+                    exclude=cfg.ingest.exclude_repos,
+                    include_archived=True,
+                ):
+                    q.upsert_repo(conn, target_id=t.id, **r)
+                    n_refreshed += 1
+            console.print(
+                f"[dim]Refreshed {n_refreshed} repo rows for org {t.name} "
+                f"(archived/visibility).[/dim]"
+            )
 
 
 def _ingest_scratch_notes(
@@ -1086,25 +1159,37 @@ def _print_pipeline_state(
                 )
 
     # --- Per-target ingest cursors ---
+    # Cursor ratios are over *active* (non-archived) repos because
+    # `q.list_repos(include_archived=False)` is the default at every ingest
+    # read site — archived repos don't get walked, so counting them in the
+    # denominator makes "commits 12/30" look stuck when it's actually done.
     console.print("  Ingest cursors:")
     for kind, name, tid in target_rows:
         repos = conn.execute(
-            "SELECT COUNT(*) AS n, "
-            "SUM(CASE WHEN last_commits_at IS NOT NULL THEN 1 ELSE 0 END) AS c, "
-            "SUM(CASE WHEN last_files_at   IS NOT NULL THEN 1 ELSE 0 END) AS f, "
-            "SUM(CASE WHEN last_reviews_at IS NOT NULL THEN 1 ELSE 0 END) AS r "
+            "SELECT COUNT(*) AS n_total, "
+            "SUM(CASE WHEN archived=0 THEN 1 ELSE 0 END) AS n_active, "
+            "SUM(CASE WHEN archived=1 THEN 1 ELSE 0 END) AS n_archived, "
+            "SUM(CASE WHEN archived=0 AND last_commits_at IS NOT NULL THEN 1 ELSE 0 END) AS c, "
+            "SUM(CASE WHEN archived=0 AND last_files_at   IS NOT NULL THEN 1 ELSE 0 END) AS f, "
+            "SUM(CASE WHEN archived=0 AND last_reviews_at IS NOT NULL THEN 1 ELSE 0 END) AS r "
             "FROM repo WHERE target_id=?",
             (tid,),
         ).fetchone()
-        n = repos["n"] or 0
-        if n == 0:
+        n_total = repos["n_total"] or 0
+        n_active = repos["n_active"] or 0
+        n_archived = repos["n_archived"] or 0
+        if n_total == 0:
             console.print(f"    [dim]{kind} {name}: no repos discovered[/dim]")
             continue
+        archived_note = f" [dim]({n_archived} archived)[/dim]" if n_archived else ""
+        if n_active == 0:
+            console.print(f"    {kind} {name}: 0 active repos{archived_note}")
+            continue
         console.print(
-            f"    {kind} {name}: {n} repos · "
-            f"commits {repos['c'] or 0}/{n} · "
-            f"files {repos['f'] or 0}/{n} · "
-            f"reviews {repos['r'] or 0}/{n}"
+            f"    {kind} {name}: {n_active} active repos{archived_note} · "
+            f"commits {repos['c'] or 0}/{n_active} · "
+            f"files {repos['f'] or 0}/{n_active} · "
+            f"reviews {repos['r'] or 0}/{n_active}"
         )
 
 

@@ -38,6 +38,7 @@ def _repo(name: str, **over: Any) -> dict[str, Any]:
         "default_branch": "main",
         "pushed_at": "2024-01-01T00:00:00Z",
         "archived": False,
+        "visibility": "public",
         "fork": False,
         "size": 42,
     }
@@ -70,22 +71,67 @@ def test_enumerate_org_repos_yields_shaped_dicts():
     gh = FakeGH(
         [
             _repo("org/a", size=10),
-            _repo("org/b", archived=True, size=20),
-            _repo("org/c", fork=True, size=30),
+            _repo("org/c", fork=True, size=30, visibility="private"),
         ]
     )
     out = list(enumerate_org_repos(gh, "org"))
-    assert [r["full_name"] for r in out] == ["org/a", "org/b", "org/c"]
+    assert [r["full_name"] for r in out] == ["org/a", "org/c"]
     assert out[0] == {
         "full_name": "org/a",
         "default_branch": "main",
         "pushed_at": "2024-01-01T00:00:00Z",
         "archived": False,
+        "visibility": "public",
         "fork": False,
         "size_kb": 10,
     }
+    assert out[1]["fork"] is True
+    assert out[1]["visibility"] == "private"
+
+
+def test_enumerate_org_repos_skips_archived_by_default():
+    gh = FakeGH(
+        [
+            _repo("org/active"),
+            _repo("org/archived", archived=True),
+            _repo("org/internal-archived", archived=True, visibility="internal"),
+        ]
+    )
+    out = list(enumerate_org_repos(gh, "org"))
+    assert [r["full_name"] for r in out] == ["org/active"]
+
+
+def test_enumerate_org_repos_keeps_archived_when_opted_in():
+    gh = FakeGH(
+        [
+            _repo("org/active"),
+            _repo("org/archived", archived=True),
+            _repo("org/internal-archived", archived=True, visibility="internal"),
+        ]
+    )
+    out = list(enumerate_org_repos(gh, "org", include_archived=True))
+    assert [r["full_name"] for r in out] == [
+        "org/active",
+        "org/archived",
+        "org/internal-archived",
+    ]
     assert out[1]["archived"] is True
-    assert out[2]["fork"] is True
+    assert out[2]["visibility"] == "internal"
+
+
+def test_enumerate_org_repos_passes_through_missing_visibility():
+    """Older GHE responses may omit `visibility`; we should store NULL, not raise."""
+    raw = {
+        "full_name": "org/legacy",
+        "default_branch": "main",
+        "pushed_at": "2024-01-01T00:00:00Z",
+        "archived": False,
+        "fork": False,
+        "size": 1,
+    }
+    gh = FakeGH([raw])
+    out = list(enumerate_org_repos(gh, "org"))
+    assert out[0]["visibility"] is None
 
 
 def test_enumerate_org_repos_applies_include():

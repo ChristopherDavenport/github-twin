@@ -227,6 +227,7 @@ def discover_repo(
         "default_branch": data.get("default_branch"),
         "pushed_at": data.get("pushed_at"),
         "archived": bool(data.get("archived", False)),
+        "visibility": data.get("visibility"),
         "fork": is_fork,
         "size_kb": data.get("size"),
     }

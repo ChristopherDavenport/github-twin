@@ -531,6 +531,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
         path: str | None = None,
         keep_fork: bool = False,
         skip_sync: bool = False,
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """One-shot setup: discover the target, ingest, embed.
 
@@ -551,6 +552,9 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
             skip_sync: stop after writing target/repo rows; caller invokes
                 `sync` later. Use this when you want fast first-call
                 feedback and will run the long ingest separately.
+            include_archived: include archived repos in org enumeration
+                (default: skip them, which also catches internal-archived).
+                Overrides cfg.ingest.include_archived for this call.
         """
         with tracer().start_as_current_span("mcp.tool.bootstrap") as span:
             set_safe_attributes(
@@ -560,6 +564,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                     "gh_twin.bootstrap.name": name,
                     "gh_twin.bootstrap.skip_sync": skip_sync,
                     "gh_twin.bootstrap.keep_fork": keep_fork,
+                    "gh_twin.bootstrap.include_archived": include_archived,
                 },
             )
             spec = BootstrapSpec(
@@ -568,6 +573,7 @@ def _serve(cfg: Config, conn: sqlite3.Connection) -> None:
                 path=Path(path) if path else None,
                 keep_fork=keep_fork,
                 skip_sync=skip_sync,
+                include_archived=include_archived,
             )
             step = [0]
 

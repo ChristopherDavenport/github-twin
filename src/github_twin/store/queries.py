@@ -186,17 +186,28 @@ def upsert_repo(
     archived: bool = False,
     fork: bool = False,
     size_kb: int | None = None,
+    visibility: str | None = None,
 ) -> None:
     """Insert or refresh repo metadata. Cursors (head_sha, last_*_at) are not
     touched here — those advance through `set_repo_cursor` after each phase."""
     conn.execute(
         "INSERT INTO repo (target_id, full_name, default_branch, pushed_at, "
-        "archived, fork, size_kb) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "archived, visibility, fork, size_kb) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id, full_name) DO UPDATE SET "
         "default_branch=excluded.default_branch, pushed_at=excluded.pushed_at, "
-        "archived=excluded.archived, fork=excluded.fork, size_kb=excluded.size_kb",
-        (target_id, full_name, default_branch, pushed_at, int(archived), int(fork), size_kb),
+        "archived=excluded.archived, visibility=excluded.visibility, "
+        "fork=excluded.fork, size_kb=excluded.size_kb",
+        (
+            target_id,
+            full_name,
+            default_branch,
+            pushed_at,
+            int(archived),
+            visibility,
+            int(fork),
+            size_kb,
+        ),
     )
 
 

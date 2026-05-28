@@ -676,6 +676,7 @@ def _ingest_commits_local(
                     default_branch=row.get("default_branch"),
                     pushed_at=pushed,
                     archived=bool(row.get("archived")),
+                    visibility=row.get("visibility"),
                     fork=bool(row.get("fork")),
                     size_kb=row.get("size_kb"),
                 )
@@ -735,6 +736,7 @@ def _ingest_commits_local(
                     default_branch=row.get("default_branch"),
                     pushed_at=pushed,
                     archived=bool(row.get("archived")),
+                    visibility=row.get("visibility"),
                     fork=bool(row.get("fork")),
                     size_kb=row.get("size_kb"),
                 )
@@ -829,7 +831,7 @@ def _ingest_commits_org_local(
     fetches its own batch.
     """
     stats = CommitStats()
-    all_repos = q.list_repos(conn, target_id=target_id)
+    all_repos = q.list_repos(conn, target_id=target_id, include_archived=cfg.include_archived)
     allowed = [r for r in all_repos if _allowed_repo(r["full_name"], cfg)]
     if not allowed:
         return stats
@@ -854,6 +856,7 @@ def _ingest_commits_org_local(
                     default_branch=row.get("default_branch"),
                     pushed_at=pushed,
                     archived=bool(row.get("archived")),
+                    visibility=row.get("visibility"),
                     fork=bool(row.get("fork")),
                     size_kb=row.get("size_kb"),
                 )
@@ -913,6 +916,7 @@ def _ingest_commits_org_local(
                     default_branch=row.get("default_branch"),
                     pushed_at=pushed,
                     archived=bool(row.get("archived")),
+                    visibility=row.get("visibility"),
                     fork=bool(row.get("fork")),
                     size_kb=row.get("size_kb"),
                 )
@@ -1073,7 +1077,7 @@ def _ingest_commits_org_api(
     limit_per_repo: int | None = None,
 ) -> CommitStats:
     stats = CommitStats()
-    for row in q.list_repos(conn, target_id=target_id):
+    for row in q.list_repos(conn, target_id=target_id, include_archived=cfg.include_archived):
         repo_full = row["full_name"]
         cursor = row.get("last_commits_at") or cfg.since
         log.info("commits org (api): %s since %s", repo_full, cursor)

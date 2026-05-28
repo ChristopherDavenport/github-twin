@@ -42,12 +42,20 @@ def enumerate_org_repos(
     *,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
+    include_archived: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """Yield repo dicts (one per matching repo) shaped for `upsert_repo`.
 
     Pagination is handled by `GitHubClient.paginate`. `type=all` returns
-    sources + forks + private repos the token can see; the `fork` column on
-    each row preserves that info for later filtering at query time.
+    sources + forks + private repos the token can see; the `fork` and
+    `visibility` columns on each row preserve that info for later filtering
+    at query time.
+
+    `include_archived=False` (the default) drops `archived=true` repos at
+    enumeration so they never enter the DB. Pass `True` from sync to
+    refresh archive state for already-known repos — downstream
+    `q.list_repos(include_archived=False)` then naturally excludes them
+    from ingest.
     """
     include = include or []
     exclude = exclude or []
@@ -62,11 +70,15 @@ def enumerate_org_repos(
             continue
         if not repo_passes_filters(full_name, include=include, exclude=exclude):
             continue
+        is_archived = bool(item.get("archived", False))
+        if is_archived and not include_archived:
+            continue
         yield {
             "full_name": full_name,
             "default_branch": item.get("default_branch"),
             "pushed_at": item.get("pushed_at"),
-            "archived": bool(item.get("archived", False)),
+            "archived": is_archived,
+            "visibility": item.get("visibility"),
             "fork": bool(item.get("fork", False)),
             "size_kb": item.get("size"),
         }
