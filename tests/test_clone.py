@@ -157,6 +157,90 @@ def test_is_shallow_helper(monkeypatch):
     assert clone_mod._is_shallow(Path("/x")) is False
 
 
+def test_head_sha_raises_empty_repo_error_on_unknown_revision(monkeypatch, tmp_path: Path):
+    """A successful clone of an empty repo (no commits) fails `git rev-parse HEAD`
+    with 'ambiguous argument' / 'unknown revision'. `_head_sha` converts that into
+    `EmptyRepoError` so callers can distinguish it from a real clone failure."""
+
+    def fake_git(args, *, cwd=None):
+        raise clone_mod.CloneError(
+            "git rev-parse HEAD failed (128): fatal: ambiguous argument 'HEAD': "
+            "unknown revision or path not in the working tree."
+        )
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    with pytest.raises(clone_mod.EmptyRepoError, match="no commits"):
+        clone_mod._head_sha(tmp_path, "org/empty-repo")
+
+
+def test_head_sha_propagates_other_clone_errors(monkeypatch, tmp_path: Path):
+    """Non-empty-repo failures (e.g. corrupted .git dir) keep raising plain CloneError."""
+
+    def fake_git(args, *, cwd=None):
+        raise clone_mod.CloneError("git rev-parse HEAD failed (128): fatal: not a git repository")
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+    with pytest.raises(clone_mod.CloneError, match="not a git repository") as exc:
+        clone_mod._head_sha(tmp_path, "org/repo")
+    assert not isinstance(exc.value, clone_mod.EmptyRepoError)
+
+
+def test_empty_repo_error_is_clone_error_subclass():
+    """Existing `except CloneError` blocks must continue to catch empty-repo errors
+    when callers haven't been updated to special-case them."""
+    assert issubclass(clone_mod.EmptyRepoError, clone_mod.CloneError)
+
+
+def test_fetch_update_quiets_shallow_info_error(monkeypatch, tmp_path: Path):
+    """`git fetch --shallow-since=<date>` raises 'error processing shallow info'
+    when no commits exist newer than the cutoff (quiet template repos). Treat
+    that as a no-op: return current HEAD, never raise, and still scrub the
+    remote so the auth URL doesn't linger.
+    """
+    path = tmp_path / "repo"
+    path.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_git(args, *, cwd=None):
+        calls.append(list(args))
+        cmd = args[0]
+        if cmd == "fetch":
+            raise clone_mod.CloneError(
+                "git fetch --shallow-since=2026-05-26 --no-tags origin failed (128): "
+                "fatal: error processing shallow info: 4"
+            )
+        if cmd == "rev-parse":
+            return "deadbeef"
+        return ""
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+
+    head = clone_mod._fetch_update(
+        path, "org/quiet-repo", "tkn", depth=1, shallow_since="2026-05-26"
+    )
+    assert head == "deadbeef"
+    # Remote was set to auth URL up front; scrub must still run via the finally.
+    set_url_calls = [c for c in calls if c[:2] == ["remote", "set-url"]]
+    assert set_url_calls[0][3] == clone_mod._auth_url("org/quiet-repo", "tkn")
+    assert set_url_calls[-1][3] == clone_mod._public_url("org/quiet-repo")
+
+
+def test_fetch_update_propagates_other_clone_errors(monkeypatch, tmp_path: Path):
+    """Only the 'shallow info' case is quieted; other fetch failures still raise."""
+    path = tmp_path / "repo"
+    path.mkdir()
+
+    def fake_git(args, *, cwd=None):
+        if args[0] == "fetch":
+            raise clone_mod.CloneError("git fetch failed (128): fatal: remote hung up")
+        return ""
+
+    monkeypatch.setattr(clone_mod, "_git", fake_git)
+
+    with pytest.raises(clone_mod.CloneError, match="remote hung up"):
+        clone_mod._fetch_update(path, "org/repo", "tkn", depth=1, shallow_since="2026-05-26")
+
+
 def test_git_decodes_non_utf8_output_with_replacement(monkeypatch, tmp_path: Path):
     """`git show` of a diff containing non-UTF-8 bytes must not crash _git.
 

@@ -29,7 +29,7 @@ from typing import Any
 
 from github_twin.config import IngestCfg
 from github_twin.ingest.cache import RawCache
-from github_twin.ingest.clone import CloneError, _git, commits_clone
+from github_twin.ingest.clone import CloneError, EmptyRepoError, _git, commits_clone
 from github_twin.ingest.github_client import GitHubClient, GitHubError
 from github_twin.ingest.identity import bulk_resolve_logins, resolve_login
 from github_twin.process.chunkers import chunk_commit_message, chunk_diff
@@ -445,7 +445,10 @@ def _write_repo_records(
     `resolve_author_login=False` skips the email→login lookup (user-mode,
     where artifacts are stored with `author_login=NULL` by convention)."""
     if records.error is not None:
-        log.warning("walk %s failed, skipping: %s", records.repo_full, records.error)
+        if isinstance(records.error, EmptyRepoError):
+            log.debug("skip %s: %s", records.repo_full, records.error)
+        else:
+            log.warning("walk %s failed, skipping: %s", records.repo_full, records.error)
         stats.skipped += 1
         return
 
