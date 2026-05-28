@@ -137,6 +137,40 @@ def test_ingest_files_skips_unchanged_repo(tmp_path: Path, conn, monkeypatch):
     assert called["n"] == 0
 
 
+def test_ingest_files_skips_empty_repo_quietly(tmp_path: Path, conn, monkeypatch, caplog):
+    """Template / placeholder repos with no commits raise EmptyRepoError from the
+    clone layer. The walker must skip them as a counted skip without emitting a
+    WARNING — they're expected, not failures."""
+    import logging
+
+    from github_twin.ingest.clone import EmptyRepoError
+
+    q.upsert_repo(
+        conn,
+        target_id=1,
+        full_name="org/empty",
+        default_branch="main",
+        pushed_at="2024-01-01T00:00:00Z",
+        archived=False,
+        fork=False,
+        size_kb=1,
+    )
+
+    @contextmanager
+    def empty(*a, **k):
+        raise EmptyRepoError("org/empty: repository has no commits")
+        yield  # pragma: no cover - unreachable
+
+    monkeypatch.setattr(files_mod, "cloned_repo", empty)
+
+    with caplog.at_level(logging.WARNING, logger="github_twin.ingest.files"):
+        stats = files_mod.ingest_files(conn=conn, cfg=IngestCfg(), target_id=1)
+
+    assert stats.repos_visited == 0
+    assert stats.repos_skipped == 1
+    assert caplog.records == []
+
+
 def test_ingest_files_skips_oversize_repo(tmp_path: Path, conn, monkeypatch):
     q.upsert_repo(
         conn,

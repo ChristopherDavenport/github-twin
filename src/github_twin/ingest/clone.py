@@ -51,6 +51,15 @@ class CloneError(RuntimeError):
     pass
 
 
+class EmptyRepoError(CloneError):
+    """Clone succeeded but the repository has no commits (HEAD doesn't resolve).
+
+    Template / placeholder repos hit this. Callers should skip the repo
+    cleanly rather than warn — there's nothing to ingest, ever, until a
+    commit is pushed.
+    """
+
+
 @dataclass(frozen=True)
 class ClonedRepo:
     full_name: str  # 'owner/name'
@@ -85,6 +94,17 @@ def _git(args: list[str], *, cwd: Path | None = None) -> str:
             f"git {' '.join(args)} failed ({out.returncode}): {out.stderr.strip()[:400]}"
         )
     return out.stdout.strip()
+
+
+def _head_sha(path: Path, full_name: str) -> str:
+    """Return HEAD sha, raising EmptyRepoError when the repo has no commits."""
+    try:
+        return _git(["rev-parse", "HEAD"], cwd=path)
+    except CloneError as e:
+        msg = str(e)
+        if "unknown revision" in msg or "ambiguous argument 'HEAD'" in msg:
+            raise EmptyRepoError(f"{full_name}: repository has no commits") from e
+        raise
 
 
 def _auth_url(full_name: str, token: str) -> str:
@@ -123,7 +143,7 @@ def _fresh_clone(
     args += [_auth_url(full_name, token), str(path)]
     _git(args)
     _scrub_remote(path, full_name)
-    return _git(["rev-parse", "HEAD"], cwd=path)
+    return _head_sha(path, full_name)
 
 
 def _is_shallow(path: Path) -> bool:
@@ -149,15 +169,30 @@ def _fetch_update(
     _git(["remote", "set-url", "origin", _auth_url(full_name, token)], cwd=path)
     try:
         if shallow_since is not None:
-            _git(
-                [
-                    "fetch",
-                    f"--shallow-since={shallow_since}",
-                    "--no-tags",
-                    "origin",
-                ],
-                cwd=path,
-            )
+            try:
+                _git(
+                    [
+                        "fetch",
+                        f"--shallow-since={shallow_since}",
+                        "--no-tags",
+                        "origin",
+                    ],
+                    cwd=path,
+                )
+            except CloneError as e:
+                # `error processing shallow info` from `git fetch --shallow-since`
+                # means there are no commits newer than the cutoff date — the
+                # server can't establish a shallow boundary. Quiet repos (e.g.
+                # template repos) hit this on every sync. The clone state is
+                # unchanged, so return the existing HEAD as a no-op.
+                if "shallow info" not in str(e):
+                    raise
+                log.debug(
+                    "fetch %s: no commits newer than %s; treating as no-op",
+                    full_name,
+                    shallow_since,
+                )
+                return _head_sha(path, full_name)
         elif depth is None:
             if _is_shallow(path):
                 _git(["fetch", "--unshallow", "--no-tags", "origin"], cwd=path)
@@ -173,7 +208,7 @@ def _fetch_update(
         _git(["reset", "--hard", short], cwd=path)
     finally:
         _scrub_remote(path, full_name)
-    return _git(["rev-parse", "HEAD"], cwd=path)
+    return _head_sha(path, full_name)
 
 
 @dataclass(frozen=True)

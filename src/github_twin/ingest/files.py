@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from github_twin.config import IngestCfg
-from github_twin.ingest.clone import CloneError, cloned_repo
+from github_twin.ingest.clone import CloneError, EmptyRepoError, cloned_repo
 from github_twin.process.chunkers import chunk_file
 from github_twin.process.language import language_for_path
 from github_twin.store import queries as q
@@ -133,6 +133,10 @@ def ingest_files(
                     head_sha=clone.head_sha,
                     files_at=_now_iso(),
                 )
+        except EmptyRepoError as e:
+            log.debug("skip %s: %s", full_name, e)
+            stats.repos_skipped += 1
+            continue
         except CloneError as e:
             log.warning("clone failed for %s: %s", full_name, e)
             stats.repos_skipped += 1
