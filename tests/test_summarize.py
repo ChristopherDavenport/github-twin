@@ -317,18 +317,19 @@ def test_concurrent_run_writes_all_chunks(conn):
 
 def test_concurrent_run_parallelizes_llm_calls(conn):
     """Wall clock should be meaningfully under (n * delay) when concurrency
-    > 1. Loose bound (60% of serial) absorbs CI noise while still proving
-    that calls overlap."""
+    > 1. Delay is sized so executor/GIL overhead doesn't dominate on CI:
+    with too small a delay the fixed scheduling cost swamps the parallel
+    speedup signal and produces flakes."""
     for i in range(8):
         _seed_code(conn, text=f"def g{i}(): pass", symbol=f"g{i}", path=f"src/g{i}.py")
-    delay = 0.05
+    delay = 0.2
     llm = FakeLLM(delay=delay)
     t0 = time.monotonic()
     n = summarize_chunks(conn, llm, concurrency=4)
     elapsed = time.monotonic() - t0
     assert n == 8
-    # Serial would be >= 8 * 0.05 = 0.40s. With concurrency=4 we expect
-    # roughly 2 * 0.05 = 0.10s; allow generous headroom up to 0.24s.
+    # Serial would be >= 8 * 0.2 = 1.60s. With concurrency=4 we expect
+    # roughly 2 * 0.2 = 0.40s; allow generous headroom up to 0.96s.
     assert elapsed < 8 * delay * 0.6, f"expected parallel speedup, got {elapsed:.3f}s"
 
 
