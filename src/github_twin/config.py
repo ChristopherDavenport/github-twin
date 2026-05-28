@@ -109,17 +109,32 @@ class IngestCfg(BaseModel):
     since: str = "2018-01-01"
     include_repos: list[str] = Field(default_factory=list)
     exclude_repos: list[str] = Field(default_factory=list)
+    # Patterns matched with `fnmatch.fnmatch`, where `*` matches any
+    # character including `/` — so `*foo*` catches `foo` at any depth and
+    # the historical `**/foo/**` form misses top-level `foo/`. Patterns
+    # below are written in the form that actually works under fnmatch.
+    # The `.d.ts` and explicit `node_modules` / `vendor` entries are the
+    # parser-bomb defense: tree-sitter's TS/TSX grammar blows up on
+    # giant generated type-declaration files, and excluding them up front
+    # is cheaper than letting `MAX_AST_PARSE_BYTES` catch each one.
     exclude_paths: list[str] = Field(
         default_factory=lambda: [
-            "**/*.lock",
-            "**/package-lock.json",
-            "**/yarn.lock",
-            "**/Cargo.lock",
-            "**/vendor/**",
-            "**/node_modules/**",
-            "**/dist/**",
-            "**/build/**",
-            "**/.min.js",
+            "*.lock",
+            "*package-lock.json",
+            "*yarn.lock",
+            "*Cargo.lock",
+            "*.min.js",
+            "*.min.css",
+            "*.d.ts",
+            "*.bundle.js",
+            "*.bundle.css",
+            "*node_modules*",
+            "vendor/*",
+            "*/vendor/*",
+            "dist/*",
+            "*/dist/*",
+            "build/*",
+            "*/build/*",
         ]
     )
     # Org-mode file ingest knobs (O-C). Default is process-and-purge so a

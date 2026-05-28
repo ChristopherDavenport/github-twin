@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,25 @@ FILE_CHUNK_OVERLAP = 10
 # of body. PR descriptions get long; 2000 chars captures intent without
 # pushing the embedder anywhere near its context cap.
 MAX_PR_BODY_CHARS = 2000
+# AST-parse guards. Tree-sitter's TypeScript / TSX grammars can spend
+# unbounded CPU on pathological inputs (generated, minified, or otherwise
+# adversarial code) inside `ts_parser__do_all_potential_reductions`, and
+# the Python binding holds the GIL across `Parser.parse`, so one bad file
+# wedges every ingest worker. The size cap is the first line of defense
+# (most blowups are giant generated files); the timeout is the backstop.
+MAX_AST_PARSE_BYTES = 512 * 1024
+AST_PARSE_TIMEOUT_MICROS = 5_000_000
+
+
+def _set_parser_timeout(parser: Any, micros: int) -> None:
+    # `Parser.timeout_micros` is the only timeout API that works for
+    # bytestring sources in tree-sitter 0.25; the `progress_callback`
+    # alternative segfaults on bytestrings. The setter is deprecated and
+    # warns on every call — suppress it locally so we don't spam stderr
+    # once per parse during a full ingest.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        parser.timeout_micros = micros
 
 
 @dataclass(frozen=True)
@@ -302,12 +322,31 @@ def _chunk_hunk_ast(
         log.warning("tree-sitter unavailable; skipping AST chunk_diff")
         return
 
+    encoded = hunk.post_image.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_AST_PARSE_BYTES:
+        log.warning(
+            "tree-sitter skip (oversize hunk) path=%s bytes=%d > cap=%d",
+            hunk.path,
+            len(encoded),
+            MAX_AST_PARSE_BYTES,
+        )
+        return
+
     try:
         ts_lang = _get_language(grammar.parser_name)
         parser = Parser(ts_lang)
-        tree = parser.parse(hunk.post_image.encode("utf-8", errors="replace"))
+        _set_parser_timeout(parser, AST_PARSE_TIMEOUT_MICROS)
+        tree = parser.parse(encoded)
     except Exception as e:  # pragma: no cover - defensive against parser bugs
         log.warning("tree-sitter parse failed for hunk path=%s: %s", hunk.path, e)
+        return
+    if tree is None:
+        log.warning(
+            "tree-sitter timeout (>%dms) parsing hunk path=%s bytes=%d",
+            AST_PARSE_TIMEOUT_MICROS // 1000,
+            hunk.path,
+            len(encoded),
+        )
         return
 
     src_lines = hunk.post_image.splitlines()
@@ -488,12 +527,31 @@ def _chunk_file_ast(
         log.warning("tree-sitter unavailable; falling back for path=%s", path)
         return
 
+    encoded = content.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_AST_PARSE_BYTES:
+        log.warning(
+            "tree-sitter skip (oversize file) path=%s bytes=%d > cap=%d",
+            path,
+            len(encoded),
+            MAX_AST_PARSE_BYTES,
+        )
+        return
+
     try:
         ts_lang = get_language(grammar.parser_name)
         parser = Parser(ts_lang)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
+        _set_parser_timeout(parser, AST_PARSE_TIMEOUT_MICROS)
+        tree = parser.parse(encoded)
     except Exception as e:  # pragma: no cover - defensive against parser bugs
         log.warning("tree-sitter parse failed for path=%s: %s", path, e)
+        return
+    if tree is None:
+        log.warning(
+            "tree-sitter timeout (>%dms) parsing path=%s bytes=%d",
+            AST_PARSE_TIMEOUT_MICROS // 1000,
+            path,
+            len(encoded),
+        )
         return
 
     src_lines = content.splitlines()

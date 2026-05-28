@@ -1,4 +1,6 @@
+import github_twin.process.chunkers as chunkers_mod
 from github_twin.process.chunkers import (
+    MAX_AST_PARSE_BYTES,
     MAX_CODE_CHUNK_LINES,
     chunk_commit_message,
     chunk_diff,
@@ -123,6 +125,46 @@ def test_is_excluded_path():
     assert is_excluded_path("a/b/foo.lock", pats)
     assert is_excluded_path("a/node_modules/x/y.js", pats)
     assert not is_excluded_path("a/b/foo.py", pats)
+
+
+def test_default_exclude_paths_catch_real_parser_bombs():
+    """Pin the parser-bomb defense: the shipped IngestCfg defaults must
+    exclude the actual file paths that hung the org-mode ingest (vendored
+    `node_modules/...d.ts`, top-level `dist/`, etc.). Patterns are matched
+    with `fnmatch.fnmatch`, where `*` matches `/` — so `**/foo/**` misses
+    top-level `foo/`. This test exists so the next person editing the
+    defaults can't reintroduce that gap silently."""
+    from github_twin.config import IngestCfg
+
+    pats = IngestCfg().exclude_paths
+
+    # Real culprits found in the live cache when commits-org hung at
+    # JHADigitalCore/reporting-components -> ts_parser__do_all_potential_reductions.
+    must_exclude = [
+        "node_modules/@octokit/openapi-types/types.d.ts",
+        "nodeApp/get-digital-jwt/node_modules/typescript/lib/typescript.d.ts",
+        "Source/scripts/jackhenry.enterprise.businessObjects.d.ts",
+        "lib.d.ts",  # top-level d.ts — the `**/*.d.ts` form would miss this.
+        "dist/main.js",  # top-level dist/
+        "vendor/foo.go",  # top-level vendor/
+        "build/output.css",  # top-level build/
+        "package-lock.json",  # top-level lockfile
+        "app.min.js",
+        "app.bundle.js",
+    ]
+    for path in must_exclude:
+        assert is_excluded_path(path, pats), f"defaults should exclude {path!r}"
+
+    must_keep = [
+        "src/foo.go",
+        "src/api.ts",  # ordinary .ts, NOT a .d.ts
+        "lib/typescript.ts",  # not in node_modules
+        "build_helpers.py",  # path starts with 'build' but isn't a build/ dir
+        "distributed.go",  # starts with 'dist' but no slash
+        "vendored.go",
+    ]
+    for path in must_keep:
+        assert not is_excluded_path(path, pats), f"defaults should keep {path!r}"
 
 
 def test_chunk_commit_message():
@@ -330,3 +372,76 @@ def test_chunk_diff_unparseable_python_falls_back_per_path():
     # fallback should emit one block.
     assert len(chunks) == 1
     assert "node_kind" not in chunks[0].context
+
+
+def test_chunk_diff_skips_ast_on_oversize_hunk_and_falls_back(caplog):
+    """A hunk whose post-image exceeds MAX_AST_PARSE_BYTES must not be
+    handed to tree-sitter (it would risk a parser blowup that wedges the
+    whole ingest, since the binding holds the GIL). It should drop straight
+    into the line-block fallback path instead."""
+    # Build a Python-shaped diff whose post-image is well over the cap.
+    # Each added line is ~50 bytes; 30k lines gives ~1.5 MB post-image.
+    payload_lines = [f"+    x_{i} = '{'a' * 40}_{i}'" for i in range(30_000)]
+    diff = (
+        "diff --git a/big.py b/big.py\n"
+        "--- a/big.py\n"
+        "+++ b/big.py\n"
+        f"@@ -1,1 +1,{len(payload_lines)} @@\n" + "\n".join(payload_lines) + "\n"
+    )
+    # Sanity: the post-image (without the leading '+') is over the cap.
+    post_image_bytes = sum(len(line) for line in payload_lines)
+    assert post_image_bytes > MAX_AST_PARSE_BYTES
+
+    with caplog.at_level("WARNING", logger="github_twin.process.chunkers"):
+        chunks = list(chunk_diff(diff, repo="r", sha="s", source_url=None))
+
+    # Fallback should still emit *something* (line-block chunks).
+    assert chunks, "expected line-block fallback to emit chunks"
+    # And none of them should carry AST-only context keys.
+    assert all("node_kind" not in c.context for c in chunks)
+    # And we should have logged the skip.
+    assert any("oversize hunk" in r.message for r in caplog.records)
+
+
+def test_chunk_diff_ast_timeout_falls_back_to_line_blocks(monkeypatch, caplog):
+    """If the tree-sitter parser exceeds AST_PARSE_TIMEOUT_MICROS it
+    returns None. The hunk path must treat that exactly like a parser
+    failure: drop the AST chunks and let the line-block fallback emit."""
+
+    class _StubParser:
+        def __init__(self, *_a, **_kw):
+            self.timeout_micros = 0
+
+        def parse(self, _src):
+            return None  # simulate timeout
+
+    monkeypatch.setattr(chunkers_mod, "Node", chunkers_mod.Node, raising=False)
+
+    # Patch the lazy imports inside _chunk_hunk_ast.
+    import tree_sitter
+    import tree_sitter_language_pack
+
+    monkeypatch.setattr(tree_sitter, "Parser", _StubParser)
+    monkeypatch.setattr(
+        tree_sitter_language_pack,
+        "get_language",
+        lambda _name: object(),
+    )
+
+    diff = (
+        "diff --git a/d.py b/d.py\n"
+        "--- a/d.py\n"
+        "+++ b/d.py\n"
+        "@@ -1,1 +1,5 @@\n"
+        " keep\n"
+        "+def added_func():\n"
+        "+    return 1\n"
+        "+\n"
+        "+x = added_func()\n"
+    )
+    with caplog.at_level("WARNING", logger="github_twin.process.chunkers"):
+        chunks = list(chunk_diff(diff, repo="r", sha="s", source_url=None))
+
+    assert chunks, "fallback should still emit when parser times out"
+    assert all("node_kind" not in c.context for c in chunks)
+    assert any("tree-sitter timeout" in r.message for r in caplog.records)
