@@ -94,6 +94,11 @@ class FakeGH:
             return self.repo_info.get(repo_full, {})
         return {}
 
+    def get_json_cached(self, path: str, *, params: dict | None = None):
+        # `_fetch_repo_pushed_at` uses the conditional variant; this fake
+        # doesn't model 304s, so route to the unconditional path.
+        return self.get_json(path, params=params)
+
 
 # ---------- user mode ----------
 

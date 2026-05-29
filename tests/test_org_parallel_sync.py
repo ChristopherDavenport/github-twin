@@ -76,6 +76,14 @@ class FakeGH:
             return self.repo_info.get(rest, {})
         return {}
 
+    def get_json_cached(self, path: str, *, params: dict | None = None):
+        # Mirror unconditional path; conditional 304 handling lives in the
+        # real client and is exercised in test_github_client_conditional.
+        return self.get_json(path, params=params)
+
+    def paginate_cached(self, path: str, *, params: dict | None = None):
+        yield from self.paginate(path, params=params)
+
     def paginate(self, path: str, *, params: dict | None = None):
         self.paginate_calls.append((path, params or {}))
         if path == "/search/commits":

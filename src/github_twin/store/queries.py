@@ -422,6 +422,28 @@ def get_artifact_content_hash(
     return row["id"], row["content_hash"]
 
 
+def get_artifact_meta(
+    conn: sqlite3.Connection,
+    *,
+    target_id: int,
+    kind: str,
+    external_id: str,
+) -> dict[str, Any] | None:
+    """Return the artifact's parsed `meta_json` dict, or None when the row
+    doesn't exist. An existing row with NULL/empty meta returns `{}`."""
+    row = conn.execute(
+        "SELECT meta_json FROM artifact WHERE target_id = ? AND kind = ? AND external_id = ?",
+        (target_id, kind, external_id),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["meta_json"]
+    if not raw:
+        return {}
+    parsed: dict[str, Any] = json.loads(raw)
+    return parsed
+
+
 def update_artifact_metadata(
     conn: sqlite3.Connection,
     *,

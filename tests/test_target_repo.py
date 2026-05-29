@@ -283,7 +283,7 @@ def test_run_ingest_dispatches_repo_kind_through_org_path(conn_with_repo_target,
     # Skip the real GitHubClient context manager.
     monkeypatch.setattr(
         "github_twin.pipeline.GitHubClient",
-        lambda: _NullClient(),
+        lambda **_kw: _NullClient(),
     )
 
     cfg = Config()
@@ -306,3 +306,7 @@ class _NullClient:
         # empty info dict so the test's fake_commits / fake_reviews receive
         # a `pushed_at_by_repo={r: None}` and decide what to do internally.
         return {}
+
+    def get_json_cached(self, path: str, *, params: dict | None = None):
+        # The fast-skip pre-check now uses the conditional variant.
+        return self.get_json(path, params=params)

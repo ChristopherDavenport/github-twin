@@ -230,11 +230,113 @@ def _iter_prs_until_cursor(
         "direction": "desc",
         "per_page": 100,
     }
-    for item in gh.paginate(f"/repos/{repo_full}/pulls", params=params):
+    for item in gh.paginate_cached(f"/repos/{repo_full}/pulls", params=params):
         updated = item.get("updated_at")
         if cursor and updated and updated <= cursor:
             return
         yield item
+
+
+def _pr_number_from_url(url: str | None, *, repo_full: str, segment: str) -> int | None:
+    """Extract a PR number from a `pull_request_url` / `issue_url`.
+
+    GitHub returns absolute URLs like
+    `https://api.github.com/repos/{owner}/{name}/pulls/{n}` and
+    `.../issues/{n}`. We anchor on `{repo_full}/{segment}/` so a stray
+    URL from a transferred / forked comment doesn't get attributed to
+    the wrong repo. Returns None when the URL is missing or malformed.
+    """
+    if not url:
+        return None
+    marker = f"/repos/{repo_full}/{segment}/"
+    idx = url.find(marker)
+    if idx < 0:
+        return None
+    tail = url[idx + len(marker) :]
+    # Trim anything after the number (path or query).
+    n_str = tail.split("/", 1)[0].split("?", 1)[0]
+    try:
+        return int(n_str)
+    except ValueError:
+        return None
+
+
+def _bulk_review_comments(
+    gh: GitHubClient, repo_full: str, *, since: str | None
+) -> dict[int, list[dict[str, Any]]]:
+    """One paginated call for ALL review (per-line) comments in the repo
+    since `since`. Groups by PR number derived from `pull_request_url`.
+
+    `sort=updated&direction=desc` is load-bearing: it lets a future ETag
+    layer short-circuit pagination on a 304 from page 1 (any new comment
+    pushes the newest row onto page 1)."""
+    params: dict[str, Any] = {
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": 100,
+    }
+    if since:
+        params["since"] = since
+    out: dict[int, list[dict[str, Any]]] = {}
+    for rc in gh.paginate_cached(f"/repos/{repo_full}/pulls/comments", params=params):
+        n = _pr_number_from_url(rc.get("pull_request_url"), repo_full=repo_full, segment="pulls")
+        if n is None:
+            continue
+        out.setdefault(n, []).append(rc)
+    return out
+
+
+def _bulk_issue_comments(
+    gh: GitHubClient, repo_full: str, *, since: str | None
+) -> dict[int, list[dict[str, Any]]]:
+    """One paginated call for ALL issue/PR comments in the repo since
+    `since`. Groups by issue/PR number derived from `issue_url`.
+
+    PRs ARE issues from this endpoint's perspective, so the caller is
+    responsible for filtering the grouped result down to PR numbers it
+    cares about."""
+    params: dict[str, Any] = {
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": 100,
+    }
+    if since:
+        params["since"] = since
+    out: dict[int, list[dict[str, Any]]] = {}
+    for ic in gh.paginate_cached(f"/repos/{repo_full}/issues/comments", params=params):
+        n = _pr_number_from_url(ic.get("issue_url"), repo_full=repo_full, segment="issues")
+        if n is None:
+            continue
+        out.setdefault(n, []).append(ic)
+    return out
+
+
+def _needs_reviews_refresh(
+    pr_item: dict[str, Any],
+    *,
+    rc_group: list[dict[str, Any]] | None,
+    ic_group: list[dict[str, Any]] | None,
+    cursor: str | None,
+) -> bool:
+    """Decide whether to call /pulls/{n}/reviews for one PR.
+
+    True when:
+      - either bulk comment fetch surfaced an entry for this PR (a new
+        review-comment OR issue-comment usually rides alongside a review
+        state change), OR
+      - the PR's `updated_at` is past the cursor AND the PR is closed
+        (catches approve/merge transitions that left no comment).
+
+    First-ever sync (cursor=None) returns True — we always want the
+    initial set of reviews."""
+    if cursor is None:
+        return True
+    if rc_group or ic_group:
+        return True
+    updated = pr_item.get("updated_at")
+    if not updated or updated <= cursor:
+        return False
+    return (pr_item.get("state") or "").lower() == "closed"
 
 
 def _per_reviewer_decisions(reviews_all: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -262,11 +364,18 @@ def _per_reviewer_decisions(reviews_all: list[dict[str, Any]]) -> list[dict[str,
 
 @dataclass
 class _PrPayload:
-    """Raw PR data fetched by a worker; consumed on the writer thread."""
+    """Raw PR data fetched by a worker; consumed on the writer thread.
+
+    `reviews_all` is `None` when the org-mode bulk path skipped the
+    per-PR `/pulls/{n}/reviews` fetch — `_ingest_one_pr` preserves the
+    existing `reviewer_decisions` (and user-mode `decision`) in that
+    case rather than collapsing them to empty. The user-mode path
+    always fetches reviews and so always passes a list (possibly
+    empty)."""
 
     pr_item: dict[str, Any]
     review_comments: list[dict[str, Any]]
-    reviews_all: list[dict[str, Any]]
+    reviews_all: list[dict[str, Any]] | None
     issue_comments: list[dict[str, Any]]
 
 
@@ -282,9 +391,9 @@ def _fetch_pr_payload(
         return None
     try:
         review_comments = list(
-            gh.paginate(
+            gh.paginate_cached(
                 f"/repos/{repo_full}/pulls/{pr_number}/comments",
-                params={"per_page": 100},
+                params={"per_page": 100, "sort": "updated", "direction": "desc"},
             )
         )
         reviews_all = list(
@@ -367,16 +476,28 @@ def _ingest_one_pr(
     # needing a chunk rewrite. User-mode also sets the artifact `decision`
     # column from the keep-only author's most recent review state, which
     # `predict_review_outcome` aggregates over.
-    reviewer_decisions = _per_reviewer_decisions(reviews_all)
-    decision: str | None = None
-    if keep_only_login is not None:
-        my_reviews = [
-            r for r in reviews_all if (r.get("user") or {}).get("login") == keep_only_login
-        ]
-        decision = _decision_from_reviews(my_reviews)
+    #
+    # `reviews_all is None` is the bulk-path sentinel: the org-mode worker
+    # skipped /pulls/{n}/reviews because nothing in the bulk comment
+    # results pointed at this PR. Reuse what we already have rather than
+    # collapsing reviewer_decisions / decision to empty.
     pr_body = pr_item.get("body") or ""
     pr_hash = _hash_text(pr_title, pr_body)
     pr_external = f"{repo_full}#{pr_number}"
+    if reviews_all is None:
+        prior_meta = (
+            q.get_artifact_meta(conn, target_id=target_id, kind="pr", external_id=pr_external) or {}
+        )
+        reviewer_decisions = prior_meta.get("reviewer_decisions", [])
+        decision = None  # user-mode never reaches this branch
+    else:
+        reviewer_decisions = _per_reviewer_decisions(reviews_all)
+        decision = None
+        if keep_only_login is not None:
+            my_reviews = [
+                r for r in reviews_all if (r.get("user") or {}).get("login") == keep_only_login
+            ]
+            decision = _decision_from_reviews(my_reviews)
     pr_meta = {
         "title": pr_title,
         "state": pr_item.get("state"),
@@ -556,9 +677,15 @@ def _ingest_one_pr(
 
 @dataclass
 class _RepoReviewRecords:
-    """Worker output: pre-fetched PR payloads for one repo."""
+    """Worker output: pre-fetched PR payloads for one repo.
+
+    `walk_started_at` is captured before any HTTP call so the cursor
+    advances to a timestamp older than any comment that might land
+    mid-walk — the next sync re-fetches anything created during the
+    window."""
 
     repo_full: str
+    walk_started_at: str = ""
     payloads: list[_PrPayload] = field(default_factory=list)
     error: BaseException | None = None
     elapsed_seconds: float = 0.0
@@ -571,19 +698,51 @@ def _walk_repo_reviews(
     cursor: str | None,
     limit_prs: int | None,
 ) -> _RepoReviewRecords:
-    """Worker: enumerate PRs above the cursor and fetch each PR's
-    sub-endpoint payload. No DB or RawCache writes — pure fetch."""
-    records = _RepoReviewRecords(repo_full=repo_full)
+    """Worker: bulk-fetch all repo comments since `cursor`, then for each
+    PR newer than `cursor` build a `_PrPayload` from the grouped data,
+    only hitting /pulls/{n}/reviews when `_needs_reviews_refresh` says so.
+
+    No DB or RawCache writes — pure fetch."""
+    records = _RepoReviewRecords(
+        repo_full=repo_full,
+        walk_started_at=_now_iso(),
+    )
     t0 = time.monotonic()
     try:
+        rc_by_pr = _bulk_review_comments(gh, repo_full, since=cursor)
+        ic_by_pr = _bulk_issue_comments(gh, repo_full, since=cursor)
         for seen, pr_item in enumerate(
             _iter_prs_until_cursor(gh, repo_full=repo_full, cursor=cursor)
         ):
             if limit_prs is not None and seen >= limit_prs:
                 break
-            payload = _fetch_pr_payload(gh, repo_full, pr_item)
-            if payload is not None:
-                records.payloads.append(payload)
+            pr_number = pr_item.get("number")
+            if pr_number is None:
+                continue
+            rc_group = rc_by_pr.get(pr_number, [])
+            ic_group = ic_by_pr.get(pr_number, [])
+            reviews_all: list[dict[str, Any]] | None
+            if _needs_reviews_refresh(pr_item, rc_group=rc_group, ic_group=ic_group, cursor=cursor):
+                try:
+                    reviews_all = list(
+                        gh.paginate(
+                            f"/repos/{repo_full}/pulls/{pr_number}/reviews",
+                            params={"per_page": 100},
+                        )
+                    )
+                except GitHubError as e:
+                    log.warning("skip reviews fetch %s#%d: %s", repo_full, pr_number, e)
+                    continue
+            else:
+                reviews_all = None
+            records.payloads.append(
+                _PrPayload(
+                    pr_item=pr_item,
+                    review_comments=rc_group,
+                    reviews_all=reviews_all,
+                    issue_comments=ic_group,
+                )
+            )
     except GitHubError as e:
         records.error = e
     records.elapsed_seconds = time.monotonic() - t0
@@ -702,7 +861,7 @@ def ingest_reviews_org(
                     conn,
                     target_id=target_id,
                     full_name=records.repo_full,
-                    reviews_at=_now_iso(),
+                    reviews_at=records.walk_started_at or _now_iso(),
                 )
             n_comments = sum(
                 len(p.review_comments) + len(p.issue_comments) for p in records.payloads

@@ -48,6 +48,11 @@ class FakeGH:
         self.reviews = reviews or {}
         self.issue_comments = issue_comments or {}
 
+    def paginate_cached(self, path: str, *, params: dict | None = None):
+        # `_fetch_pr_payload`'s per-PR `/pulls/{n}/comments` now uses the
+        # conditional variant. Route to the unconditional fixture path.
+        yield from self.paginate(path, params=params)
+
     def paginate(self, path: str, *, params: dict | None = None):
         if path == "/search/issues":
             yield from self.prs

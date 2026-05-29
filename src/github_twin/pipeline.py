@@ -31,6 +31,7 @@ from github_twin.ingest.reviews import ingest_reviews, ingest_reviews_org
 from github_twin.process.summarize import summarize_chunks
 from github_twin.store import queries as q
 from github_twin.store.db import transaction
+from github_twin.store.sqlite_http_cache import SqliteHttpCache
 from github_twin.target import Target, load_targets
 
 
@@ -176,7 +177,7 @@ def _ingest_one(
             s_files = ingest_files(conn=conn, cfg=cfg.ingest, target_id=target.id, limit=limit)
             summary["files"] = s_files
             report(f"files: {s_files}")
-        with GitHubClient() as gh:
+        with GitHubClient(cache=SqliteHttpCache(conn)) as gh:
             # Share the /repos/{r} batch across the commits + reviews phases
             # so the fast-skip pre-check costs one round of API calls per
             # sync, not two. Each phase still owns its own per-repo
@@ -215,7 +216,7 @@ def _ingest_one(
     # Ctrl-C and per-worker failures.
     cache = RawCache(cfg.paths.raw_dir)
     summary = {}
-    with GitHubClient() as gh:
+    with GitHubClient(cache=SqliteHttpCache(conn)) as gh:
         if not reviews_only:
             s_commits = ingest_commits(
                 conn=conn,
