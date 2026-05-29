@@ -406,7 +406,7 @@ def _fetch_repo_pushed_at(
 
     def _one(repo_full: str) -> tuple[str, str | None]:
         try:
-            data = gh.get_json(f"/repos/{repo_full}")
+            data = gh.get_json_cached(f"/repos/{repo_full}")
             return repo_full, data.get("pushed_at")
         except GitHubError as e:
             log.warning("/repos/%s failed: %s", repo_full, e)
